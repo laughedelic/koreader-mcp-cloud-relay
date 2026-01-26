@@ -30,10 +30,10 @@ export default {
             "GET /": "This info page",
             "GET /{deviceId}/status": "Check if device is online",
             "POST /{deviceId}/mcp": "Forward MCP request to device",
-            "WebSocket /{deviceId}/ws": "Device connection endpoint (WebSocket mode)",
             "POST /{deviceId}/register": "Device registration (HTTP polling mode)",
             "GET /{deviceId}/poll": "Poll for requests (HTTP polling mode)",
             "POST /{deviceId}/response": "Send response (HTTP polling mode)",
+            "POST /{deviceId}/pong": "Keep-alive heartbeat",
           },
         }),
         {
@@ -69,7 +69,7 @@ export default {
     }
 
     // Validate action
-    const validActions = ["ws", "mcp", "status", "register", "poll", "response", "pong"];
+    const validActions = ["mcp", "status", "register", "poll", "response", "pong"];
     if (!validActions.includes(action)) {
       return jsonError(
         `Invalid action: ${action}. Valid actions: ${validActions.join(", ")}`,

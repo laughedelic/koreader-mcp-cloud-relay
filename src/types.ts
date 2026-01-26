@@ -1,38 +1,37 @@
-// Shared types for MCP Relay protocol
+/**
+ * Simplified types for HTTP Long-Polling only
+ * 
+ * This is a proposed simplified version that removes WebSocket-related types.
+ * To use: rename to types.ts
+ */
 
 // ============================================
-// Device → Relay (WebSocket Messages)
+// Device → Relay Messages
 // ============================================
 
 export interface RegisterMessage {
-  type: "register";
-  deviceId?: string;    // Optional: reuse previous ID for reconnection
-  deviceName?: string;  // Optional: human-readable name (e.g., "My Kindle")
-  version?: string;     // Plugin version for compatibility checking
+  type?: "register";      // Optional since it's implied by endpoint
+  deviceId?: string;      // Reuse previous ID for reconnection
+  deviceName?: string;    // Human-readable name (e.g., "My Kindle")
+  version?: string;       // Plugin version
 }
 
 export interface ResponseMessage {
-  type: "response";
+  type?: "response";      // Optional since it's implied by endpoint
   requestId: string;
   status: number;
   headers?: Record<string, string>;
-  body: string;  // JSON string (the MCP response)
+  body: string;           // JSON string (the MCP response)
 }
-
-export interface PongMessage {
-  type: "pong";
-}
-
-export type DeviceMessage = RegisterMessage | ResponseMessage | PongMessage;
 
 // ============================================
-// Relay → Device (WebSocket Messages)
+// Relay → Device Messages
 // ============================================
 
 export interface RegisteredMessage {
   type: "registered";
   deviceId: string;
-  relayUrl: string;  // Full URL for MCP clients to use
+  relayUrl: string;       // Full URL for MCP clients
 }
 
 export interface RequestMessage {
@@ -41,20 +40,12 @@ export interface RequestMessage {
   method: string;
   path: string;
   headers: Record<string, string>;
-  body: string;  // JSON string (the MCP request)
+  body: string;           // JSON string (the MCP request)
 }
 
 export interface PingMessage {
   type: "ping";
 }
-
-export interface ErrorMessage {
-  type: "error";
-  code: string;
-  message: string;
-}
-
-export type RelayMessage = RegisteredMessage | RequestMessage | PingMessage | ErrorMessage;
 
 // ============================================
 // Internal Types
@@ -93,7 +84,7 @@ export interface ErrorResponse {
 }
 
 // ============================================
-// Environment bindings
+// Environment
 // ============================================
 
 export interface Env {
