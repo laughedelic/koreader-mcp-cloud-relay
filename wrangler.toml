@@ -22,7 +22,7 @@ local_protocol = "http"
 # pattern = "mcp.koreader.dev/*"
 # custom_domain = true
 
-[observability]
-[observability.logs]
-enabled = true
-invocation_logs = true
+# [observability]
+# [observability.logs]
+# enabled = true
+# invocation_logs = true
