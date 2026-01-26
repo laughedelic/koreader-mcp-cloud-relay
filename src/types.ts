@@ -1,10 +1,3 @@
-/**
- * Simplified types for HTTP Long-Polling only
- * 
- * This is a proposed simplified version that removes WebSocket-related types.
- * To use: rename to types.ts
- */
-
 // ============================================
 // Device → Relay Messages
 // ============================================

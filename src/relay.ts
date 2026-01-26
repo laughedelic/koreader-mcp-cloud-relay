@@ -1,12 +1,3 @@
-/**
- * Simplified MCP Relay - HTTP Long-Polling Only
- * 
- * This is a proposed simplified version that removes WebSocket support
- * since KOReader only uses HTTP long-polling.
- * 
- * To use: rename to relay.ts and update types.ts accordingly
- */
-
 import {
   RegisterMessage,
   ResponseMessage,
