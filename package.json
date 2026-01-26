@@ -1,0 +1,25 @@
+{
+  "name": "mcp-relay-cloudflare",
+  "version": "1.0.0",
+  "description": "Cloud relay for KOReader MCP server - enables remote access via WebSocket bridge",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4",
+    "typescript": "^5.9.3",
+    "wrangler": "4"
+  },
+  "keywords": [
+    "mcp",
+    "cloudflare-workers",
+    "websocket",
+    "relay",
+    "koreader"
+  ],
+  "author": "laughedelic",
+  "license": "AGPL-3.0"
+}

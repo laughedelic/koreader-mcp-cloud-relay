@@ -1,0 +1,28 @@
+name = "mcp-relay"
+main = "src/index.ts"
+compatibility_date = "2024-06-01"
+
+# Durable Objects binding
+[[durable_objects.bindings]]
+name = "MCP_RELAY"
+class_name = "MCPRelay"
+
+# Migrations for Durable Objects
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MCPRelay"]
+
+# Development settings
+[dev]
+port = 8787
+local_protocol = "http"
+
+# Optional: Custom domain (uncomment and configure)
+# [[routes]]
+# pattern = "mcp.koreader.dev/*"
+# custom_domain = true
+
+# [observability]
+# [observability.logs]
+# enabled = true
+# invocation_logs = true
