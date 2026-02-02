@@ -29,10 +29,24 @@ const mcpApiHandler = {
     const path = url.pathname;
     
     // Parse path to extract deviceId and action
-    // Expected format: /{deviceId}/mcp
+    // Supported formats:
+    // - /mcp (with X-Device-Id header)
+    // - /{deviceId}/mcp (legacy direct path)
     const pathParts = path.split("/").filter(Boolean);
-    
-    if (pathParts.length < 2) {
+    const headerDeviceId = request.headers.get("X-Device-Id") || undefined;
+
+    let deviceId: string | undefined;
+    let action: string | undefined;
+
+    if (pathParts.length === 1 && pathParts[0] === "mcp") {
+      deviceId = headerDeviceId;
+      action = "mcp";
+    } else if (pathParts.length >= 2) {
+      deviceId = pathParts[0];
+      action = pathParts[1];
+    }
+
+    if (!deviceId || action !== "mcp") {
       return new Response(JSON.stringify({
         jsonrpc: "2.0",
         error: { code: -32600, message: "Invalid path. Expected /{deviceId}/mcp" },
@@ -42,8 +56,6 @@ const mcpApiHandler = {
         headers: { "Content-Type": "application/json" },
       });
     }
-
-    const [deviceId, action] = pathParts;
     
     // Only handle /mcp endpoint here (other endpoints don't need OAuth)
     if (action !== "mcp") {
@@ -96,18 +108,43 @@ const mcpApiHandler = {
  * - /oauth/register endpoint (dynamic client registration)
  * - Token validation for protected routes
  */
-export default new OAuthProvider({
+const oauthProvider = new OAuthProvider({
   // OAuth endpoints
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/oauth/token",
   clientRegistrationEndpoint: "/oauth/register",
 
   // Protected API route - requires valid Bearer token
-  // This pattern matches /{deviceId}/mcp endpoints
-  apiRoute: ["/*/mcp"],
+  // Use a stable prefix so OAuthProvider can match it
+  apiRoute: "/mcp",
   apiHandler: mcpApiHandler,
 
   // Default handler for all other routes (auth UI, home page, device endpoints)
   // @ts-expect-error - Type mismatch between Hono and OAuthProvider
   defaultHandler: AuthHandler,
 });
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const match = url.pathname.match(/^\/([^/]+)\/mcp$/);
+
+    // Rewrite /{deviceId}/mcp -> /mcp and pass deviceId via header
+    if (match) {
+      const deviceId = match[1];
+      const rewritten = new URL(request.url);
+      rewritten.pathname = "/mcp";
+
+      const headers = new Headers(request.headers);
+      headers.set("X-Device-Id", deviceId);
+
+      request = new Request(rewritten.toString(), {
+        method: request.method,
+        headers,
+        body: request.body,
+      });
+    }
+
+    return oauthProvider.fetch(request, env, ctx);
+  },
+};
