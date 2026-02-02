@@ -22,28 +22,6 @@ export interface ResponseMessage {
 // OAuth Types
 // ============================================
 
-export interface TokenRequest {
-  grant_type: "password";
-  username: string;       // Device ID
-  password: string;       // Numeric passcode
-  scope?: string;         // Optional scopes (default: mcp:access)
-}
-
-export interface TokenResponse {
-  access_token: string;
-  token_type: "Bearer";
-  expires_in: number;
-  scope: string;
-}
-
-export interface TokenPayload {
-  sub: string;            // Device ID
-  aud: string;            // Relay URL
-  iat: number;            // Issued at
-  exp: number;            // Expires at
-  scope: string;          // Granted scopes
-}
-
 export interface OAuthError {
   error: string;
   error_description?: string;
@@ -125,6 +103,6 @@ export interface ErrorResponse {
 
 export interface Env {
   MCP_RELAY: DurableObjectNamespace;
-  // JWT signing secret (should be configured in Cloudflare Workers secrets)
-  JWT_SECRET?: string;
+  // KV namespace for OAuth state (tokens, clients, authorization codes)
+  OAUTH_KV: KVNamespace;
 }

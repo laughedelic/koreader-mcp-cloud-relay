@@ -1,4 +1,3 @@
-import { SignJWT, jwtVerify } from "jose";
 import {
   RegisterMessage,
   ResponseMessage,
@@ -6,8 +5,6 @@ import {
   DeviceInfo,
   RequestMessage,
   StatusResponse,
-  TokenResponse,
-  TokenPayload,
   OAuthError,
 } from "./types";
 
@@ -15,7 +12,6 @@ import {
 const REQUEST_TIMEOUT = 30000;  // 30 seconds - how long client waits for device response
 const POLL_TIMEOUT = 30000;     // 30 seconds - how long device poll blocks
 const SESSION_TIMEOUT = 120000; // 2 minutes - device considered offline after this
-const TOKEN_EXPIRY_SECONDS = 3600; // 1 hour token lifetime
 
 /**
  * Generate a unique request ID
@@ -42,49 +38,6 @@ async function hashPasscode(passcode: string): Promise<string> {
 async function verifyPasscode(passcode: string, storedHash: string): Promise<boolean> {
   const computedHash = await hashPasscode(passcode);
   return computedHash === storedHash;
-}
-
-/**
- * Generate a JWT token using jose library
- */
-async function generateToken(payload: TokenPayload, secret: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const secretKey = encoder.encode(secret);
-  
-  const jwt = await new SignJWT({ scope: payload.scope })
-    .setProtectedHeader({ alg: "HS256" })
-    .setSubject(payload.sub)
-    .setAudience(payload.aud)
-    .setIssuedAt()
-    .setExpirationTime(`${TOKEN_EXPIRY_SECONDS}s`)
-    .sign(secretKey);
-  
-  return jwt;
-}
-
-/**
- * Verify and decode a JWT token using jose library
- */
-async function verifyToken(token: string, secret: string, expectedAudience?: string): Promise<TokenPayload | null> {
-  try {
-    const encoder = new TextEncoder();
-    const secretKey = encoder.encode(secret);
-    
-    const { payload } = await jwtVerify(token, secretKey, {
-      algorithms: ["HS256"],
-      ...(expectedAudience ? { audience: expectedAudience } : {}),
-    });
-    
-    return {
-      sub: payload.sub || "",
-      aud: (Array.isArray(payload.aud) ? payload.aud[0] : payload.aud) || "",
-      iat: payload.iat || 0,
-      exp: payload.exp || 0,
-      scope: (payload.scope as string) || "mcp:access",
-    };
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -126,7 +79,6 @@ interface PollWaiter {
 export class MCPRelay implements DurableObject {
   private state: DurableObjectState;
   private baseUrl: string = "";
-  private jwtSecret: string = "";
   
   // Device state
   private deviceInfo: DeviceInfo | null = null;
@@ -151,7 +103,6 @@ export class MCPRelay implements DurableObject {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     this.baseUrl = request.headers.get("X-Relay-Base-URL") || `${url.protocol}//${url.host}`;
-    this.jwtSecret = request.headers.get("X-JWT-Secret") || this.baseUrl; // Fallback to baseUrl as secret
     
     const pathParts = url.pathname.split("/").filter(Boolean);
     const action = pathParts[1] || "";
@@ -192,10 +143,11 @@ export class MCPRelay implements DurableObject {
         return request.method === "GET"
           ? this.handleStatus()
           : this.methodNotAllowed();
-      
-      case "verify-credentials":
+
+      // Internal endpoint for OAuth authorization flow
+      case "verify-passcode":
         return request.method === "POST"
-          ? this.handleVerifyCredentials(request)
+          ? this.handleVerifyPasscode(request)
           : this.methodNotAllowed();
           
       default:
@@ -274,50 +226,33 @@ export class MCPRelay implements DurableObject {
   }
 
   /**
-   * POST /verify-credentials - Internal endpoint for token generation
-   * Called by the main worker to verify passcode and generate JWT
+   * POST /verify-passcode - Internal endpoint for OAuth authorization
+   * Called by the auth handler to verify device passcode during OAuth flow
+   * Returns 200 OK if valid, 401 if invalid
    */
-  private async handleVerifyCredentials(request: Request): Promise<Response> {
+  private async handleVerifyPasscode(request: Request): Promise<Response> {
     let body: { passcode: string };
     try {
       body = await request.json();
     } catch {
-      return this.oauthError("invalid_request", "Invalid JSON", 400);
+      return this.jsonResponse({ valid: false, error: "Invalid JSON" }, 400);
     }
 
     if (!this.deviceInfo) {
-      return this.oauthError("invalid_grant", "Device not registered", 401);
+      return this.jsonResponse({ valid: false, error: "Device not registered" }, 401);
     }
 
     if (!this.deviceInfo.passcodeHash) {
-      return this.oauthError("invalid_grant", "Device has no credentials", 401);
+      return this.jsonResponse({ valid: false, error: "Device has no credentials" }, 401);
     }
 
     // Verify the provided passcode by hashing and comparing
     const valid = await verifyPasscode(body.passcode, this.deviceInfo.passcodeHash);
     if (!valid) {
-      return this.oauthError("invalid_grant", "Invalid passcode", 401);
+      return this.jsonResponse({ valid: false, error: "Invalid passcode" }, 401);
     }
 
-    // Generate access token using jose
-    const payload: TokenPayload = {
-      sub: this.deviceInfo.deviceId,
-      aud: `${this.baseUrl}/${this.deviceInfo.deviceId}/mcp`,
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + TOKEN_EXPIRY_SECONDS,
-      scope: "mcp:access",
-    };
-
-    const token = await generateToken(payload, this.jwtSecret);
-
-    const response: TokenResponse = {
-      access_token: token,
-      token_type: "Bearer",
-      expires_in: TOKEN_EXPIRY_SECONDS,
-      scope: "mcp:access",
-    };
-
-    return this.jsonResponse(response);
+    return this.jsonResponse({ valid: true });
   }
 
   /**
@@ -415,48 +350,21 @@ export class MCPRelay implements DurableObject {
 
   /**
    * POST /mcp - MCP client sends request to device
-   * Requires Bearer token authentication
+   * 
+   * Authentication is handled by the OAuthProvider in index.ts.
+   * Requests that reach this handler are already authenticated.
    */
   private async handleMCPRequest(request: Request): Promise<Response> {
-    // Validate authentication
-    const authHeader = request.headers.get("Authorization");
+    // Check if this request was pre-authenticated by the OAuthProvider
+    const oauthAuthenticated = request.headers.get("X-OAuth-Authenticated") === "true";
     
-    // Check if device has credentials set (authentication required)
-    if (this.deviceInfo?.passcodeHash) {
-      if (!authHeader) {
-        // Return 401 with WWW-Authenticate header per RFC 9728
-        return this.unauthorizedResponse(
-          "Bearer token required",
-          `${this.baseUrl}/${this.deviceInfo?.deviceId || "unknown"}/.well-known/oauth-protected-resource`
-        );
-      }
-      
-      if (!authHeader.startsWith("Bearer ")) {
-        return this.unauthorizedResponse(
-          "Invalid authorization header format",
-          `${this.baseUrl}/${this.deviceInfo?.deviceId || "unknown"}/.well-known/oauth-protected-resource`
-        );
-      }
-      
-      const token = authHeader.slice(7);
-      const expectedAudience = `${this.baseUrl}/${this.deviceInfo.deviceId}/mcp`;
-      const payload = await verifyToken(token, this.jwtSecret, expectedAudience);
-      
-      if (!payload) {
-        return this.unauthorizedResponse(
-          "Invalid or expired token",
-          `${this.baseUrl}/${this.deviceInfo?.deviceId || "unknown"}/.well-known/oauth-protected-resource`
-        );
-      }
-      
-      // Verify token is for this device
-      if (payload.sub !== this.deviceInfo?.deviceId) {
-        return this.jsonResponse({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Token not valid for this device" },
-          id: null,
-        }, 403);
-      }
+    // If the device has credentials configured, require OAuth authentication
+    if (this.deviceInfo?.passcodeHash && !oauthAuthenticated) {
+      // Return 401 with WWW-Authenticate header per RFC 9728
+      return this.unauthorizedResponse(
+        "Bearer token required",
+        `${this.baseUrl}/${this.deviceInfo?.deviceId || "unknown"}/.well-known/oauth-protected-resource`
+      );
     }
 
     if (!this.isDeviceOnline()) {
