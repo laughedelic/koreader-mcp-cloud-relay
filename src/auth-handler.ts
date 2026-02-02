@@ -16,6 +16,29 @@ interface AuthEnv extends Env {
 const app = new Hono<{ Bindings: AuthEnv }>();
 
 /**
+ * Extract device ID from OAuth resource URL
+ * e.g., "https://relay.example.com/my-kindle/mcp" -> "my-kindle"
+ */
+function extractDeviceIdFromResource(resource: string | undefined): string | null {
+  if (!resource) return null;
+  try {
+    const url = new URL(resource);
+    const parts = url.pathname.split("/").filter(Boolean);
+    // Expect path like /{deviceId}/mcp or /{deviceId}/.well-known/...
+    if (parts.length >= 1) {
+      const deviceId = parts[0];
+      // Validate format
+      if (/^[a-z0-9][a-z0-9-]{4,22}[a-z0-9]$/i.test(deviceId)) {
+        return deviceId;
+      }
+    }
+  } catch {
+    // Invalid URL
+  }
+  return null;
+}
+
+/**
  * GET /authorize - OAuth authorization endpoint
  * 
  * Shows a login form where users enter the device ID and passcode
@@ -29,9 +52,17 @@ app.get("/authorize", async (c) => {
     return c.text("Invalid client_id", 400);
   }
 
+  // Extract device ID from resource URL
+  const resource = Array.isArray(oauthReqInfo.resource) ? oauthReqInfo.resource[0] : oauthReqInfo.resource;
+  const resourceDeviceId = extractDeviceIdFromResource(resource);
+  
   // Check for error from failed login attempt
   const error = c.req.query("error");
   const errorDeviceId = c.req.query("device_id") || "";
+  
+  // Use device ID from: 1) error redirect, 2) resource URL, 3) empty
+  const deviceId = errorDeviceId || resourceDeviceId || "";
+  const deviceIdFromResource = !!resourceDeviceId && !errorDeviceId;
 
   const loginPage = `
     <!DOCTYPE html>
@@ -39,12 +70,12 @@ app.get("/authorize", async (c) => {
       <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Connect to KOReader Device</title>
+        <title>Connect to KOReader</title>
         <style>
           * { box-sizing: border-box; }
           body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #f5f5f5;
             min-height: 100vh;
             margin: 0;
             display: flex;
@@ -54,134 +85,126 @@ app.get("/authorize", async (c) => {
           }
           .card {
             background: white;
-            border-radius: 12px;
-            padding: 40px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            max-width: 450px;
+            border-radius: 8px;
+            padding: 32px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            max-width: 400px;
             width: 100%;
           }
           h1 {
-            margin: 0 0 10px;
-            color: #333;
-            font-size: 24px;
+            margin: 0 0 8px;
+            color: #1a1a1a;
+            font-size: 20px;
+            font-weight: 600;
           }
           .subtitle {
             color: #666;
-            margin-bottom: 30px;
-            line-height: 1.5;
+            margin-bottom: 24px;
+            font-size: 14px;
           }
           .error {
-            background: #fee;
-            border: 1px solid #fcc;
-            color: #c00;
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            color: #b91c1c;
             padding: 12px;
             border-radius: 6px;
-            margin-bottom: 20px;
+            margin-bottom: 16px;
             font-size: 14px;
           }
           .form-group {
-            margin-bottom: 20px;
+            margin-bottom: 16px;
           }
           label {
             display: block;
-            font-weight: 600;
-            margin-bottom: 8px;
+            font-weight: 500;
+            margin-bottom: 6px;
             color: #333;
+            font-size: 14px;
           }
           input[type="text"], input[type="password"] {
             width: 100%;
-            padding: 14px;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
-            font-size: 16px;
-            transition: border-color 0.2s;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 15px;
           }
           input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: #333;
+          }
+          input[readonly] {
+            background: #f9f9f9;
+            color: #666;
           }
           .hint {
             font-size: 12px;
             color: #888;
-            margin-top: 6px;
+            margin-top: 4px;
           }
           .actions {
             display: flex;
-            gap: 12px;
-            margin-top: 30px;
+            gap: 10px;
+            margin-top: 24px;
           }
           button {
-            padding: 14px 24px;
+            padding: 10px 20px;
             border: none;
-            border-radius: 8px;
+            border-radius: 6px;
             cursor: pointer;
-            font-size: 16px;
-            font-weight: 600;
-            transition: transform 0.1s, box-shadow 0.2s;
-          }
-          button:active {
-            transform: scale(0.98);
+            font-size: 14px;
+            font-weight: 500;
           }
           .connect {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #1a1a1a;
             color: white;
             flex: 1;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
           }
           .connect:hover {
-            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+            background: #333;
           }
           .cancel {
             background: #f0f0f0;
             color: #666;
           }
-          .client-info {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 25px;
-            font-size: 14px;
+          .cancel:hover {
+            background: #e5e5e5;
           }
-          .client-info strong {
-            color: #333;
+          .device-info {
+            background: #f9f9f9;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            font-size: 13px;
+            color: #555;
           }
-          .instructions {
-            background: #e8f4fd;
-            border-left: 4px solid #667eea;
-            padding: 15px;
-            margin-bottom: 25px;
-            font-size: 14px;
-            line-height: 1.6;
-          }
-          .instructions ol {
-            margin: 10px 0 0 0;
-            padding-left: 20px;
+          .device-info code {
+            color: #1a1a1a;
+            font-family: "SF Mono", Monaco, monospace;
+            background: #e5e5e5;
+            padding: 2px 6px;
+            border-radius: 3px;
           }
         </style>
       </head>
       <body>
         <div class="card">
-          <h1>📚 Connect to KOReader</h1>
-          <p class="subtitle">Enter your device credentials to authorize access.</p>
-          
-          <div class="instructions">
-            <strong>How to find your credentials:</strong>
-            <ol>
-              <li>Open KOReader on your device</li>
-              <li>Go to: ☰ Menu → Tools → MCP Server → Status</li>
-              <li>Find your Device ID and Passcode</li>
-            </ol>
-          </div>
+          <h1>Connect to KOReader</h1>
+          <p class="subtitle">Enter the passcode shown on your device.</p>
 
-          <div class="client-info">
-            <strong>${clientInfo.clientName || "MCP Client"}</strong> is requesting access to your KOReader device.
+          ${deviceIdFromResource ? `
+          <div class="device-info">
+            Connecting to device: <code>${deviceId}</code>
           </div>
+          ` : ""}
 
-          ${error ? `<div class="error">❌ ${error === "invalid_credentials" ? "Invalid device ID or passcode. Please check your credentials and try again." : "Authentication failed. Please try again."}</div>` : ""}
+          ${error ? `<div class="error">Invalid credentials. Please check and try again.</div>` : ""}
 
           <form method="POST" action="/authorize">
             <input type="hidden" name="oauth_state" value="${btoa(JSON.stringify(oauthReqInfo))}">
             
+            ${deviceIdFromResource ? `
+            <input type="hidden" name="device_id" value="${deviceId}">
+            ` : `
             <div class="form-group">
               <label for="device_id">Device ID</label>
               <input 
@@ -189,13 +212,14 @@ app.get("/authorize", async (c) => {
                 id="device_id" 
                 name="device_id" 
                 placeholder="e.g., kobo-library"
-                value="${errorDeviceId}"
+                value="${deviceId}"
                 required
                 pattern="[a-zA-Z0-9][a-zA-Z0-9-]{4,22}[a-zA-Z0-9]"
                 autocomplete="username"
               >
-              <p class="hint">6-24 characters, letters, numbers, and hyphens</p>
+              <p class="hint">Shown in KOReader: Menu → Tools → MCP Server</p>
             </div>
+            `}
 
             <div class="form-group">
               <label for="passcode">Passcode</label>
@@ -203,12 +227,13 @@ app.get("/authorize", async (c) => {
                 type="password" 
                 id="passcode" 
                 name="passcode" 
-                placeholder="Enter your 6-digit passcode"
+                placeholder="6-digit code"
                 required
                 minlength="6"
                 maxlength="6"
                 pattern="[0-9]{6}"
                 autocomplete="current-password"
+                autofocus
               >
               <p class="hint">6-digit code shown on your device</p>
             </div>
@@ -257,7 +282,8 @@ app.post("/authorize", async (c) => {
   const stub = c.env.MCP_RELAY.get(doId);
   
   try {
-    const verifyResponse = await stub.fetch(new Request("http://internal/verify-passcode", {
+    // The DO expects paths like /{deviceId}/verify-passcode
+    const verifyResponse = await stub.fetch(new Request(`http://internal/${deviceId}/verify-passcode`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ passcode }),
@@ -279,7 +305,8 @@ app.post("/authorize", async (c) => {
       return c.redirect(url.toString(), 302);
     }
   } catch (error) {
-    return c.text("Failed to verify credentials", 500);
+    console.error("Verify passcode error:", error);
+    return c.text(`Failed to verify credentials: ${error instanceof Error ? error.message : "Unknown error"}`, 500);
   }
 
   // Credentials valid - complete OAuth authorization
@@ -317,72 +344,78 @@ app.get("/", (c) => {
           * { box-sizing: border-box; }
           body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #f5f5f5;
             min-height: 100vh;
             margin: 0;
             padding: 40px 20px;
           }
           .container {
-            max-width: 800px;
+            max-width: 700px;
             margin: 0 auto;
           }
           .card {
             background: white;
-            border-radius: 12px;
-            padding: 40px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            margin-bottom: 30px;
+            border-radius: 8px;
+            padding: 32px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 24px;
           }
           h1 {
-            margin: 0 0 10px;
-            color: #333;
+            margin: 0 0 8px;
+            color: #1a1a1a;
+            font-size: 24px;
           }
           h2 {
-            color: #444;
-            border-bottom: 2px solid #667eea;
-            padding-bottom: 10px;
+            color: #333;
+            font-size: 16px;
+            margin: 24px 0 12px;
+            font-weight: 600;
           }
           .subtitle {
             color: #666;
-            font-size: 18px;
-            margin-bottom: 30px;
+            font-size: 15px;
+            margin-bottom: 24px;
           }
           .endpoint {
-            background: #f5f5f5;
-            padding: 12px 15px;
-            border-radius: 6px;
-            margin: 10px 0;
+            background: #f9f9f9;
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin: 6px 0;
             font-family: "SF Mono", Monaco, monospace;
-            font-size: 14px;
+            font-size: 13px;
             display: flex;
-            gap: 10px;
+            align-items: center;
+            gap: 8px;
           }
           .method {
-            background: #667eea;
-            color: white;
-            padding: 2px 8px;
-            border-radius: 4px;
+            background: #e5e5e5;
+            color: #333;
+            padding: 2px 6px;
+            border-radius: 3px;
             font-weight: 600;
-            font-size: 12px;
+            font-size: 11px;
           }
-          .method.get { background: #22c55e; }
-          .method.post { background: #3b82f6; }
-          ol, ul {
+          .method.get { background: #dcfce7; color: #166534; }
+          .method.post { background: #dbeafe; color: #1e40af; }
+          ol {
             line-height: 1.8;
+            padding-left: 20px;
           }
           code {
             background: #f0f0f0;
             padding: 2px 6px;
-            border-radius: 4px;
+            border-radius: 3px;
             font-family: "SF Mono", Monaco, monospace;
+            font-size: 13px;
           }
           .url-box {
-            background: #1a1a2e;
-            color: #00ff88;
-            padding: 15px 20px;
-            border-radius: 8px;
+            background: #1a1a1a;
+            color: #4ade80;
+            padding: 12px 16px;
+            border-radius: 6px;
             font-family: "SF Mono", Monaco, monospace;
-            margin: 15px 0;
+            font-size: 14px;
+            margin: 12px 0;
             word-break: break-all;
           }
         </style>
@@ -390,31 +423,28 @@ app.get("/", (c) => {
       <body>
         <div class="container">
           <div class="card">
-            <h1>📚 MCP Relay for KOReader</h1>
+            <h1>MCP Relay for KOReader</h1>
             <p class="subtitle">Connect AI assistants to your e-reader via the Model Context Protocol</p>
             
             <h2>Quick Start</h2>
             <ol>
               <li>Enable MCP Server in KOReader (Menu → Tools → MCP Server)</li>
               <li>Note your <strong>Device ID</strong> and <strong>Passcode</strong></li>
-              <li>Add this server to your MCP client:</li>
+              <li>Add this URL to your MCP client:</li>
             </ol>
             
             <div class="url-box">${baseUrl}/{deviceId}/mcp</div>
             
-            <p>Replace <code>{deviceId}</code> with your actual device ID (e.g., <code>kobo-library</code>).</p>
+            <p style="font-size: 14px; color: #666;">Replace <code>{deviceId}</code> with your device ID.</p>
 
             <h2>OAuth Endpoints</h2>
             <div class="endpoint"><span class="method get">GET</span> /.well-known/oauth-authorization-server</div>
-            <div class="endpoint"><span class="method get">GET</span> /.well-known/oauth-protected-resource</div>
-            <div class="endpoint"><span class="method get">GET</span> /authorize</div>
             <div class="endpoint"><span class="method post">POST</span> /oauth/token</div>
             <div class="endpoint"><span class="method post">POST</span> /oauth/register</div>
 
             <h2>Device Endpoints</h2>
-            <div class="endpoint"><span class="method post">POST</span> /{deviceId}/mcp - MCP requests (requires auth)</div>
-            <div class="endpoint"><span class="method get">GET</span> /{deviceId}/status - Check if device is online</div>
-            <div class="endpoint"><span class="method post">POST</span> /{deviceId}/register - Device registration</div>
+            <div class="endpoint"><span class="method post">POST</span> /{deviceId}/mcp</div>
+            <div class="endpoint"><span class="method get">GET</span> /{deviceId}/status</div>
           </div>
         </div>
       </body>
