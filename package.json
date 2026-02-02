@@ -21,5 +21,8 @@
     "koreader"
   ],
   "author": "laughedelic",
-  "license": "AGPL-3.0"
+  "license": "AGPL-3.0",
+  "dependencies": {
+    "jose": "^6.1.3"
+  }
 }
