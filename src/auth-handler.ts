@@ -27,8 +27,8 @@ function extractDeviceIdFromResource(resource: string | undefined): string | nul
     // Expect path like /{deviceId}/mcp or /{deviceId}/.well-known/...
     if (parts.length >= 1) {
       const deviceId = parts[0];
-      // Validate format
-      if (/^[a-z0-9][a-z0-9-]{4,22}[a-z0-9]$/i.test(deviceId)) {
+      // Validate format (hyphen at end to avoid regex /v flag issues)
+      if (/^[a-z0-9][a-z0-9\-]{4,22}[a-z0-9]$/i.test(deviceId)) {
         return deviceId;
       }
     }
@@ -46,6 +46,10 @@ function extractDeviceIdFromResource(resource: string | undefined): string | nul
  */
 app.get("/authorize", async (c) => {
   const oauthReqInfo: AuthRequest = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
+  
+  // Debug logging
+  console.log("OAuth Request Info:", JSON.stringify(oauthReqInfo, null, 2));
+  
   const clientInfo = await c.env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
 
   if (!clientInfo) {
@@ -56,13 +60,17 @@ app.get("/authorize", async (c) => {
   const resource = Array.isArray(oauthReqInfo.resource) ? oauthReqInfo.resource[0] : oauthReqInfo.resource;
   const resourceDeviceId = extractDeviceIdFromResource(resource);
   
+  console.log("Resource:", resource, "Extracted device ID:", resourceDeviceId);
+  
   // Check for error from failed login attempt
   const error = c.req.query("error");
-  const errorDeviceId = c.req.query("device_id") || "";
+  const requestedDeviceId = c.req.query("device_id") || "";
+  const errorDeviceId = error ? requestedDeviceId : "";
+  const queryDeviceId = !error ? requestedDeviceId : "";
   
-  // Use device ID from: 1) error redirect, 2) resource URL, 3) empty
-  const deviceId = errorDeviceId || resourceDeviceId || "";
-  const deviceIdFromResource = !!resourceDeviceId && !errorDeviceId;
+  // Use device ID from: 1) error redirect, 2) query param, 3) resource URL, 4) empty
+  const deviceId = errorDeviceId || queryDeviceId || resourceDeviceId || "";
+  const deviceIdLocked = (!!resourceDeviceId || !!queryDeviceId) && !errorDeviceId;
 
   const loginPage = `
     <!DOCTYPE html>
@@ -75,70 +83,73 @@ app.get("/authorize", async (c) => {
           * { box-sizing: border-box; }
           body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f5f5f5;
+            background: #f6f7f9;
             min-height: 100vh;
             margin: 0;
             display: flex;
             align-items: center;
             justify-content: center;
-            padding: 20px;
+            padding: 24px;
+            color: #111827;
           }
           .card {
-            background: white;
-            border-radius: 8px;
-            padding: 32px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            max-width: 400px;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 28px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+            max-width: 420px;
             width: 100%;
           }
           h1 {
-            margin: 0 0 8px;
-            color: #1a1a1a;
+            margin: 0 0 6px;
+            color: #111827;
             font-size: 20px;
             font-weight: 600;
           }
           .subtitle {
-            color: #666;
-            margin-bottom: 24px;
+            color: #6b7280;
+            margin-bottom: 20px;
             font-size: 14px;
           }
           .error {
             background: #fef2f2;
             border: 1px solid #fecaca;
             color: #b91c1c;
-            padding: 12px;
-            border-radius: 6px;
+            padding: 10px 12px;
+            border-radius: 8px;
             margin-bottom: 16px;
-            font-size: 14px;
+            font-size: 13px;
           }
           .form-group {
-            margin-bottom: 16px;
+            margin-bottom: 14px;
           }
           label {
             display: block;
             font-weight: 500;
             margin-bottom: 6px;
-            color: #333;
-            font-size: 14px;
+            color: #374151;
+            font-size: 13px;
           }
           input[type="text"], input[type="password"] {
             width: 100%;
             padding: 10px 12px;
-            border: 1px solid #ddd;
-            border-radius: 6px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
             font-size: 15px;
+            background: #fff;
           }
           input:focus {
             outline: none;
-            border-color: #333;
+            border-color: #111827;
+            box-shadow: 0 0 0 3px rgba(17, 24, 39, 0.08);
           }
           input[readonly] {
-            background: #f9f9f9;
-            color: #666;
+            background: #f9fafb;
+            color: #6b7280;
           }
           .hint {
             font-size: 12px;
-            color: #888;
+            color: #9ca3af;
             margin-top: 4px;
           }
           .actions {
@@ -155,12 +166,12 @@ app.get("/authorize", async (c) => {
             font-weight: 500;
           }
           .connect {
-            background: #1a1a1a;
+            background: #111827;
             color: white;
             flex: 1;
           }
           .connect:hover {
-            background: #333;
+            background: #0f172a;
           }
           .cancel {
             background: #f0f0f0;
@@ -170,19 +181,20 @@ app.get("/authorize", async (c) => {
             background: #e5e5e5;
           }
           .device-info {
-            background: #f9f9f9;
-            padding: 12px;
-            border-radius: 6px;
-            margin-bottom: 20px;
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            padding: 10px 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
             font-size: 13px;
-            color: #555;
+            color: #6b7280;
           }
           .device-info code {
-            color: #1a1a1a;
+            color: #111827;
             font-family: "SF Mono", Monaco, monospace;
-            background: #e5e5e5;
+            background: #e5e7eb;
             padding: 2px 6px;
-            border-radius: 3px;
+            border-radius: 4px;
           }
         </style>
       </head>
@@ -191,7 +203,7 @@ app.get("/authorize", async (c) => {
           <h1>Connect to KOReader</h1>
           <p class="subtitle">Enter the passcode shown on your device.</p>
 
-          ${deviceIdFromResource ? `
+          ${deviceIdLocked ? `
           <div class="device-info">
             Connecting to device: <code>${deviceId}</code>
           </div>
@@ -202,7 +214,7 @@ app.get("/authorize", async (c) => {
           <form method="POST" action="/authorize">
             <input type="hidden" name="oauth_state" value="${btoa(JSON.stringify(oauthReqInfo))}">
             
-            ${deviceIdFromResource ? `
+            ${deviceIdLocked ? `
             <input type="hidden" name="device_id" value="${deviceId}">
             ` : `
             <div class="form-group">
@@ -214,7 +226,7 @@ app.get("/authorize", async (c) => {
                 placeholder="e.g., kobo-library"
                 value="${deviceId}"
                 required
-                pattern="[a-zA-Z0-9][a-zA-Z0-9-]{4,22}[a-zA-Z0-9]"
+                pattern="[a-zA-Z0-9][a-zA-Z0-9\\-]{4,22}[a-zA-Z0-9]"
                 autocomplete="username"
               >
               <p class="hint">Shown in KOReader: Menu → Tools → MCP Server</p>
@@ -259,8 +271,10 @@ app.get("/authorize", async (c) => {
 app.post("/authorize", async (c) => {
   const formData = await c.req.formData();
   const oauthState = formData.get("oauth_state");
-  const deviceId = formData.get("device_id") as string;
-  const passcode = formData.get("passcode") as string;
+  const deviceIdRaw = formData.get("device_id");
+  const passcodeRaw = formData.get("passcode");
+  const deviceId = typeof deviceIdRaw === "string" ? deviceIdRaw.trim() : "";
+  const passcode = typeof passcodeRaw === "string" ? passcodeRaw.trim() : "";
 
   if (!oauthState || typeof oauthState !== "string") {
     return c.text("Missing OAuth state", 400);
@@ -310,21 +324,31 @@ app.post("/authorize", async (c) => {
   }
 
   // Credentials valid - complete OAuth authorization
-  const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
-    request: oauthReqInfo,
-    userId: deviceId,
-    metadata: {
-      label: `KOReader: ${deviceId}`,
-      deviceId: deviceId,
-    },
-    scope: oauthReqInfo.scope,
-    props: {
-      deviceId: deviceId,
-    },
-  });
+  console.log("Completing authorization for device:", deviceId);
+  console.log("OAuth request info:", JSON.stringify(oauthReqInfo, null, 2));
+  
+  try {
+    const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
+      request: oauthReqInfo,
+      userId: deviceId,
+      metadata: {
+        label: `KOReader: ${deviceId}`,
+        deviceId: deviceId,
+      },
+      scope: oauthReqInfo.scope,
+      props: {
+        deviceId: deviceId,
+      },
+    });
 
-  // Redirect back to the MCP client with authorization code
-  return c.redirect(redirectTo, 302);
+    console.log("Authorization completed, redirecting to:", redirectTo);
+    
+    // Redirect back to the MCP client with authorization code
+    return c.redirect(redirectTo, 302);
+  } catch (error) {
+    console.error("completeAuthorization error:", error);
+    return c.text(`Failed to complete authorization: ${error instanceof Error ? error.message : "Unknown error"}`, 500);
+  }
 });
 
 /**
@@ -450,6 +474,31 @@ app.get("/", (c) => {
       </body>
     </html>
   `);
+});
+
+/**
+ * GET /:deviceId/.well-known/oauth-protected-resource
+ * Device-specific OAuth Protected Resource Metadata (RFC 9728)
+ */
+app.get("/:deviceId/.well-known/oauth-protected-resource", (c) => {
+  const deviceId = c.req.param("deviceId");
+  const origin = new URL(c.req.url).origin;
+
+  if (!/^[a-z0-9][a-z0-9-]{4,22}[a-z0-9]$/i.test(deviceId)) {
+    return c.json({
+      error: {
+        code: "INVALID_DEVICE_ID",
+        message: "Invalid device ID format",
+      }
+    }, 400);
+  }
+
+  return c.json({
+    resource: `${origin}/${deviceId}/mcp`,
+    authorization_servers: [origin],
+    scopes_supported: ["mcp:access"],
+    bearer_methods_supported: ["header"],
+  });
 });
 
 /**
