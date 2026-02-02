@@ -457,9 +457,9 @@ app.get("/", (c) => {
               <li>Add this URL to your MCP client:</li>
             </ol>
             
-            <div class="url-box">${baseUrl}/{deviceId}/mcp</div>
+            <div class="url-box">${baseUrl}/mcp</div>
             
-            <p style="font-size: 14px; color: #666;">Replace <code>{deviceId}</code> with your device ID.</p>
+            <p style="font-size: 14px; color: #666;">This endpoint uses OAuth to select the device during login.</p>
 
             <h2>OAuth Endpoints</h2>
             <div class="endpoint"><span class="method get">GET</span> /.well-known/oauth-authorization-server</div>
@@ -467,7 +467,7 @@ app.get("/", (c) => {
             <div class="endpoint"><span class="method post">POST</span> /oauth/register</div>
 
             <h2>Device Endpoints</h2>
-            <div class="endpoint"><span class="method post">POST</span> /{deviceId}/mcp</div>
+            <div class="endpoint"><span class="method post">POST</span> /mcp</div>
             <div class="endpoint"><span class="method get">GET</span> /{deviceId}/status</div>
           </div>
         </div>
@@ -495,6 +495,20 @@ app.get("/:deviceId/.well-known/oauth-protected-resource", (c) => {
 
   return c.json({
     resource: `${origin}/${deviceId}/mcp`,
+    authorization_servers: [origin],
+    scopes_supported: ["mcp:access"],
+    bearer_methods_supported: ["header"],
+  });
+});
+
+/**
+ * GET /mcp/.well-known/oauth-protected-resource
+ * OAuth Protected Resource Metadata for the unified /mcp endpoint
+ */
+app.get("/mcp/.well-known/oauth-protected-resource", (c) => {
+  const origin = new URL(c.req.url).origin;
+  return c.json({
+    resource: `${origin}/mcp`,
     authorization_servers: [origin],
     scopes_supported: ["mcp:access"],
     bearer_methods_supported: ["header"],

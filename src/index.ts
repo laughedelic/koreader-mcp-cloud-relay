@@ -27,29 +27,25 @@ const mcpApiHandler = {
     const typedEnv = env as Env;
     const url = new URL(request.url);
     const path = url.pathname;
-    
-    // Parse path to extract deviceId and action
-    // Supported formats:
-    // - /mcp (with X-Device-Id header)
-    // - /{deviceId}/mcp (legacy direct path)
     const pathParts = path.split("/").filter(Boolean);
     const headerDeviceId = request.headers.get("X-Device-Id") || undefined;
+    const contextDeviceId = (ctx as unknown as { props?: { deviceId?: string } })?.props?.deviceId;
 
     let deviceId: string | undefined;
     let action: string | undefined;
 
     if (pathParts.length === 1 && pathParts[0] === "mcp") {
-      deviceId = headerDeviceId;
+      deviceId = contextDeviceId || headerDeviceId;
       action = "mcp";
     } else if (pathParts.length >= 2) {
-      deviceId = pathParts[0];
+      deviceId = contextDeviceId || pathParts[0];
       action = pathParts[1];
     }
 
     if (!deviceId || action !== "mcp") {
       return new Response(JSON.stringify({
         jsonrpc: "2.0",
-        error: { code: -32600, message: "Invalid path. Expected /{deviceId}/mcp" },
+        error: { code: -32600, message: "Missing device context for /mcp" },
         id: null,
       }), {
         status: 400,
@@ -90,7 +86,10 @@ const mcpApiHandler = {
     headers.set("X-Relay-Base-URL", url.origin);
     headers.set("X-OAuth-Authenticated", "true");
 
-    return stub.fetch(new Request(url.toString(), {
+    const forwardUrl = new URL(request.url);
+    forwardUrl.pathname = `/${deviceId}/mcp`;
+
+    return stub.fetch(new Request(forwardUrl.toString(), {
       method: request.method,
       headers,
       body: request.body,
@@ -122,6 +121,25 @@ const oauthProvider = new OAuthProvider({
   // Default handler for all other routes (auth UI, home page, device endpoints)
   // @ts-expect-error - Type mismatch between Hono and OAuthProvider
   defaultHandler: AuthHandler,
+  onError: (error) => {
+    if (error.code === "invalid_token") {
+      const headers = {
+        ...error.headers,
+        "WWW-Authenticate": `Bearer realm="mcp", error="invalid_token", error_description="${error.description}", resource_metadata="/mcp/.well-known/oauth-protected-resource"`,
+      };
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: error.description },
+        id: null,
+      }), {
+        status: error.status,
+        headers: {
+          "Content-Type": "application/json",
+          ...headers,
+        },
+      });
+    }
+  },
 });
 
 export default {
@@ -129,7 +147,7 @@ export default {
     const url = new URL(request.url);
     const match = url.pathname.match(/^\/([^/]+)\/mcp$/);
 
-    // Rewrite /{deviceId}/mcp -> /mcp and pass deviceId via header
+    // Rewrite /{deviceId}/mcp -> /mcp and pass deviceId via header (compat)
     if (match) {
       const deviceId = match[1];
       const rewritten = new URL(request.url);

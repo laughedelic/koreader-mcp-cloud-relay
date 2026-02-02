@@ -214,7 +214,7 @@ export class MCPRelay implements DurableObject {
     const response: Record<string, unknown> = {
       type: "registered",
       deviceId: body.deviceId,
-      relayUrl: `${this.baseUrl}/${body.deviceId}/mcp`,
+      relayUrl: `${this.baseUrl}/mcp`,
       tokenEndpoint: `${this.baseUrl}/oauth/token`,
     };
     
