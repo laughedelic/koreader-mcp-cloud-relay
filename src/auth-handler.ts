@@ -468,37 +468,12 @@ app.get("/", (c) => {
 
             <h2>Device Endpoints</h2>
             <div class="endpoint"><span class="method post">POST</span> /mcp</div>
-            <div class="endpoint"><span class="method get">GET</span> /{deviceId}/status</div>
+            <div class="endpoint"><span class="method get">GET</span> /status</div>
           </div>
         </div>
       </body>
     </html>
   `);
-});
-
-/**
- * GET /:deviceId/.well-known/oauth-protected-resource
- * Device-specific OAuth Protected Resource Metadata (RFC 9728)
- */
-app.get("/:deviceId/.well-known/oauth-protected-resource", (c) => {
-  const deviceId = c.req.param("deviceId");
-  const origin = new URL(c.req.url).origin;
-
-  if (!/^[a-z0-9][a-z0-9-]{4,22}[a-z0-9]$/i.test(deviceId)) {
-    return c.json({
-      error: {
-        code: "INVALID_DEVICE_ID",
-        message: "Invalid device ID format",
-      }
-    }, 400);
-  }
-
-  return c.json({
-    resource: `${origin}/${deviceId}/mcp`,
-    authorization_servers: [origin],
-    scopes_supported: ["mcp:access"],
-    bearer_methods_supported: ["header"],
-  });
 });
 
 /**

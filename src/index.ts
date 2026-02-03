@@ -145,22 +145,71 @@ const oauthProvider = new OAuthProvider({
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    const match = url.pathname.match(/^\/([^/]+)\/mcp$/);
+    const pathname = url.pathname;
 
-    // Rewrite /{deviceId}/mcp -> /mcp and pass deviceId via header (compat)
-    if (match) {
-      const deviceId = match[1];
-      const rewritten = new URL(request.url);
-      rewritten.pathname = "/mcp";
+    // Device endpoints are now root-level and identified by X-Device-Id
+    if (pathname === "/register" && request.method === "POST") {
+      let bodyText = "";
+      try {
+        bodyText = await request.clone().text();
+        const payload = JSON.parse(bodyText);
+        const deviceId = typeof payload.deviceId === "string" ? payload.deviceId.trim() : "";
+        if (!deviceId) {
+          return new Response(JSON.stringify({ error: "deviceId is required" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        const doId = env.MCP_RELAY.idFromName(deviceId);
+        const stub = env.MCP_RELAY.get(doId);
+        const forwardUrl = new URL(request.url);
+        forwardUrl.pathname = `/${deviceId}/register`;
+
+        const headers = new Headers(request.headers);
+        headers.set("X-Relay-Base-URL", url.origin);
+
+        return stub.fetch(new Request(forwardUrl.toString(), {
+          method: request.method,
+          headers,
+          body: bodyText,
+        }));
+      } catch {
+        return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    if ((pathname === "/poll" && request.method === "GET") ||
+        (pathname === "/pong" && request.method === "POST") ||
+        (pathname === "/response" && request.method === "POST") ||
+        (pathname === "/status" && request.method === "GET")) {
+      const headerDeviceId = request.headers.get("X-Device-Id") || "";
+      const queryDeviceId = url.searchParams.get("device_id") || "";
+      const deviceId = (headerDeviceId || queryDeviceId).trim();
+
+      if (!deviceId) {
+        return new Response(JSON.stringify({ error: "deviceId is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      const doId = env.MCP_RELAY.idFromName(deviceId);
+      const stub = env.MCP_RELAY.get(doId);
+      const forwardUrl = new URL(request.url);
+      forwardUrl.pathname = `/${deviceId}${pathname}`;
 
       const headers = new Headers(request.headers);
-      headers.set("X-Device-Id", deviceId);
+      headers.set("X-Relay-Base-URL", url.origin);
 
-      request = new Request(rewritten.toString(), {
+      return stub.fetch(new Request(forwardUrl.toString(), {
         method: request.method,
         headers,
         body: request.body,
-      });
+      }));
     }
 
     return oauthProvider.fetch(request, env, ctx);

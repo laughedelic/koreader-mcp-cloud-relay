@@ -23,24 +23,24 @@ sequenceDiagram
   Note over D: Hash passcode with SHA-256
 
   Note over D,R: 1) Device registration
-  D->>R: POST /{deviceId}/register (passcodeHash)
+  D->>R: POST /register (passcodeHash)
   R-->>D: 200 OK (relayUrl, tokenEndpoint)
   Note over D: Display passcode to user
 
-  Note over C,R: 2) Client gets access token
-  C->>R: POST /oauth/token (username=deviceId, password=passcode)
-  R->>R: Hash passcode & compare
+  Note over C,R: 2) Client authenticates via OAuth
+  C->>R: GET /authorize (login UI)
+  C->>R: POST /oauth/token (auth code exchange)
   R-->>C: 200 OK (access_token)
 
   Note over D,R: 3) Device polls for requests
   loop Long-poll cycle
-    D->>R: GET /{deviceId}/poll
+    D->>R: GET /poll
     alt Request available
-      C->>R: POST /{deviceId}/mcp (Authorization: Bearer token)
-      R->>R: Validate JWT token
+      C->>R: POST /mcp (Authorization: Bearer token)
+      R->>R: Validate access token
       R-->>D: 200 OK ({type:request})
       Note over D: Process request locally
-      D->>R: POST /{deviceId}/response
+      D->>R: POST /response
       R-->>C: 200 OK (MCP response)
     else Timeout
       R-->>D: 200 OK ({type:ping})
@@ -58,7 +58,7 @@ When a device registers, it **generates credentials locally** (deviceId from dev
 # Device generates: deviceId="KoboClara-abc1", passcode="123456"
 # Device computes: passcodeHash=SHA256("123456")
 
-curl -X POST https://mcp-relay.example.com/KoboClara-abc1/register \
+curl -X POST https://mcp-relay.example.com/register \
   -H "Content-Type: application/json" \
   -d '{
     "deviceId": "KoboClara-abc1",
@@ -71,7 +71,7 @@ curl -X POST https://mcp-relay.example.com/KoboClara-abc1/register \
 {
   "type": "registered",
   "deviceId": "KoboClara-abc1",
-  "relayUrl": "https://mcp-relay.example.com/KoboClara-abc1/mcp",
+  "relayUrl": "https://mcp-relay.example.com/mcp",
   "tokenEndpoint": "https://mcp-relay.example.com/oauth/token"
 }
 ```
@@ -80,28 +80,14 @@ The passcode is displayed to the user on their device. They need to enter it in 
 
 ### 2. Getting an Access Token
 
-MCP clients authenticate using the OAuth 2.0 password grant:
-
-```bash
-curl -X POST https://mcp-relay.example.com/oauth/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=password&username=KoboClara-abc1&password=123456"
-
-# Response:
-{
-  "access_token": "eyJhbGciOiJIUzI1NiIs...",
-  "token_type": "Bearer",
-  "expires_in": 3600,
-  "scope": "mcp:access"
-}
-```
+MCP clients authenticate using OAuth 2.1 Authorization Code flow with PKCE.
 
 ### 3. Making Authenticated MCP Requests
 
 Include the access token in the `Authorization` header:
 
 ```bash
-curl -X POST https://mcp-relay.example.com/KoboClara-abc1/mcp \
+curl -X POST https://mcp-relay.example.com/mcp \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc": "2.0", "method": "resources/list", "id": 1}'
@@ -111,9 +97,8 @@ curl -X POST https://mcp-relay.example.com/KoboClara-abc1/mcp \
 
 The relay implements RFC 9728 Protected Resource Metadata:
 
-- `/.well-known/oauth-protected-resource` - Global resource metadata
+- `/mcp/.well-known/oauth-protected-resource` - Protected resource metadata
 - `/.well-known/oauth-authorization-server` - Authorization server metadata
-- `/{deviceId}/.well-known/oauth-protected-resource` - Device-specific metadata
 
 ## Deployment
 
@@ -159,19 +144,21 @@ Your relay will be available at: `https://mcp-relay.<your-subdomain>.workers.dev
 
 ### Device Endpoints (used by KOReader)
 
-| Endpoint               | Method | Description                          |
-| ---------------------- | ------ | ------------------------------------ |
-| `/{deviceId}/register` | POST   | Register device with passcode hash   |
-| `/{deviceId}/poll`     | GET    | Long-poll for incoming MCP requests  |
-| `/{deviceId}/response` | POST   | Send response to a forwarded request |
-| `/{deviceId}/pong`     | POST   | Keep-alive heartbeat (optional)      |
+| Endpoint    | Method | Description                          |
+| ----------- | ------ | ------------------------------------ |
+| `/register` | POST   | Register device with passcode hash   |
+| `/poll`     | GET    | Long-poll for incoming MCP requests  |
+| `/response` | POST   | Send response to a forwarded request |
+| `/pong`     | POST   | Keep-alive heartbeat (optional)      |
+
+All device endpoints require the `X-Device-Id` header (except `/register`, which includes `deviceId` in the JSON body).
 
 ### Client Endpoints (used by Claude/MCP clients)
 
-| Endpoint             | Method | Description                              |
-| -------------------- | ------ | ---------------------------------------- |
-| `/{deviceId}/mcp`    | POST   | Send MCP request (requires Bearer token) |
-| `/{deviceId}/status` | GET    | Check if device is online                |
+| Endpoint  | Method | Description                                                                    |
+| --------- | ------ | ------------------------------------------------------------------------------ |
+| `/mcp`    | POST   | Send MCP request (requires Bearer token)                                       |
+| `/status` | GET    | Check if device is online (requires `X-Device-Id` header or `device_id` query) |
 
 ## Security
 
@@ -184,10 +171,8 @@ Your relay will be available at: `https://mcp-relay.<your-subdomain>.workers.dev
 
 ### Token Security
 
-- **Industry-standard JWT**: Uses the [jose](https://github.com/panva/jose) library for JWT handling
 - **Short-lived tokens**: Access tokens expire in 1 hour
-- **Audience validation**: Tokens are bound to specific device endpoints
-- **HMAC-SHA256 signing**: Tokens are cryptographically signed
+- **Audience validation**: Tokens are bound to the relay resource
 
 ### Best Practices
 
