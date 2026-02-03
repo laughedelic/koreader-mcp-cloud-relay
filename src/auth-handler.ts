@@ -26,7 +26,7 @@ function extractDeviceIdFromResource(resource: string | undefined): string | nul
     const parts = url.pathname.split("/").filter(Boolean);
     // Expect path like /{deviceId}/mcp or /{deviceId}/.well-known/...
     if (parts.length >= 1) {
-      const deviceId = parts[0];
+      const deviceId = parts[0].toLowerCase();
       // Validate format (hyphen at end to avoid regex /v flag issues)
       if (/^[a-z0-9][a-z0-9\-]{4,22}[a-z0-9]$/i.test(deviceId)) {
         return deviceId;
@@ -64,7 +64,7 @@ app.get("/authorize", async (c) => {
   
   // Check for error from failed login attempt
   const error = c.req.query("error");
-  const requestedDeviceId = c.req.query("device_id") || "";
+  const requestedDeviceId = (c.req.query("device_id") || "").toLowerCase();
   const errorDeviceId = error ? requestedDeviceId : "";
   const queryDeviceId = !error ? requestedDeviceId : "";
   
@@ -209,7 +209,7 @@ app.get("/authorize", async (c) => {
           </div>
           ` : ""}
 
-          ${error ? `<div class="error">Invalid credentials. Please check and try again.</div>` : ""}
+          ${error ? `<div class="error">${c.req.query("error_message") || "Invalid device ID or passcode. Please check and try again."}</div>` : ""}
 
           <form method="POST" action="/authorize">
             <input type="hidden" name="oauth_state" value="${btoa(JSON.stringify(oauthReqInfo))}">
@@ -272,7 +272,7 @@ app.post("/authorize", async (c) => {
   const oauthState = formData.get("oauth_state");
   const deviceIdRaw = formData.get("device_id");
   const passcodeRaw = formData.get("passcode");
-  const deviceId = typeof deviceIdRaw === "string" ? deviceIdRaw.trim() : "";
+  const deviceId = typeof deviceIdRaw === "string" ? deviceIdRaw.trim().toLowerCase() : "";
   const passcode = typeof passcodeRaw === "string" ? passcodeRaw.trim() : "";
 
   if (!oauthState || typeof oauthState !== "string") {
@@ -303,9 +303,18 @@ app.post("/authorize", async (c) => {
     }));
 
     if (!verifyResponse.ok) {
+      let errorMessage = "Invalid device ID or passcode.";
+      try {
+        const body = await verifyResponse.json() as { error?: string; message?: string };
+        if (body?.error) errorMessage = body.error;
+        if (body?.message) errorMessage = body.message;
+      } catch {
+        // ignore parsing errors
+      }
       // Redirect back to authorize with error
       const url = new URL(c.req.url);
       url.searchParams.set("error", "invalid_credentials");
+      url.searchParams.set("error_message", errorMessage);
       url.searchParams.set("device_id", deviceId);
       // Preserve original OAuth parameters
       for (const [key, value] of Object.entries(oauthReqInfo)) {
@@ -319,7 +328,18 @@ app.post("/authorize", async (c) => {
     }
   } catch (error) {
     console.error("Verify passcode error:", error);
-    return c.text(`Failed to verify credentials: ${error instanceof Error ? error.message : "Unknown error"}`, 500);
+    const url = new URL(c.req.url);
+    url.searchParams.set("error", "server_error");
+    url.searchParams.set("error_message", "Failed to verify credentials. Please try again.");
+    url.searchParams.set("device_id", deviceId);
+    for (const [key, value] of Object.entries(oauthReqInfo)) {
+      if (typeof value === "string") {
+        url.searchParams.set(key, value);
+      } else if (Array.isArray(value)) {
+        url.searchParams.set(key, value.join(" "));
+      }
+    }
+    return c.redirect(url.toString(), 302);
   }
 
   // Credentials valid - complete OAuth authorization

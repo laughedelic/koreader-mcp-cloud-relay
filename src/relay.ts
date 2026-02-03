@@ -178,6 +178,8 @@ export class MCPRelay implements DurableObject {
       return this.jsonError("deviceId is required", "MISSING_DEVICE_ID", 400);
     }
 
+    const normalizedDeviceId = body.deviceId.toLowerCase();
+
     const isReconnection = !!this.deviceInfo;
     
     // On first registration, passcodeHash is required
@@ -197,7 +199,7 @@ export class MCPRelay implements DurableObject {
     const passcodeHash = body.passcodeHash || this.deviceInfo?.passcodeHash;
     
     this.deviceInfo = {
-      deviceId: body.deviceId,
+      deviceId: normalizedDeviceId,
       deviceName: body.deviceName || this.deviceInfo?.deviceName,
       connectedAt: this.deviceInfo?.connectedAt || Date.now(),
       lastActivity: Date.now(),
@@ -209,11 +211,11 @@ export class MCPRelay implements DurableObject {
 
     await this.state.storage.put("deviceInfo", this.deviceInfo);
 
-    console.log(`Device registered: ${body.deviceId} (${body.deviceName || "unnamed"})${!isReconnection ? " [FIRST TIME]" : ""}`);
+    console.log(`Device registered: ${normalizedDeviceId} (${body.deviceName || "unnamed"})${!isReconnection ? " [FIRST TIME]" : ""}`);
 
     const response: Record<string, unknown> = {
       type: "registered",
-      deviceId: body.deviceId,
+      deviceId: normalizedDeviceId,
       relayUrl: `${this.baseUrl}/mcp`,
       tokenEndpoint: `${this.baseUrl}/oauth/token`,
     };

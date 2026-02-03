@@ -42,6 +42,10 @@ const mcpApiHandler = {
       action = pathParts[1];
     }
 
+    if (deviceId) {
+      deviceId = deviceId.toLowerCase();
+    }
+
     if (!deviceId || action !== "mcp") {
       return new Response(JSON.stringify({
         jsonrpc: "2.0",
@@ -153,7 +157,7 @@ export default {
       try {
         bodyText = await request.clone().text();
         const payload = JSON.parse(bodyText);
-        const deviceId = typeof payload.deviceId === "string" ? payload.deviceId.trim() : "";
+        const deviceId = typeof payload.deviceId === "string" ? payload.deviceId.trim().toLowerCase() : "";
         if (!deviceId) {
           return new Response(JSON.stringify({ error: "deviceId is required" }), {
             status: 400,
@@ -188,7 +192,7 @@ export default {
         (pathname === "/status" && request.method === "GET")) {
       const headerDeviceId = request.headers.get("X-Device-Id") || "";
       const queryDeviceId = url.searchParams.get("device_id") || "";
-      const deviceId = (headerDeviceId || queryDeviceId).trim();
+      const deviceId = (headerDeviceId || queryDeviceId).trim().toLowerCase();
 
       if (!deviceId) {
         return new Response(JSON.stringify({ error: "deviceId is required" }), {
