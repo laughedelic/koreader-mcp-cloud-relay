@@ -201,7 +201,7 @@ app.get("/authorize", async (c) => {
       <body>
         <div class="card">
           <h1>Connect to KOReader</h1>
-          <p class="subtitle">Enter the passcode shown on your device.</p>
+          <p class="subtitle">Enter the credentials shown on your reading device.</p>
 
           ${deviceIdLocked ? `
           <div class="device-info">
@@ -223,13 +223,13 @@ app.get("/authorize", async (c) => {
                 type="text" 
                 id="device_id" 
                 name="device_id" 
-                placeholder="e.g., kobo-library"
+                placeholder="e.g., kindle-a1b2"
                 value="${deviceId}"
                 required
                 pattern="[a-zA-Z0-9][a-zA-Z0-9\\-]{4,22}[a-zA-Z0-9]"
                 autocomplete="username"
               >
-              <p class="hint">Shown in KOReader: Menu → Tools → MCP Server</p>
+              <p class="hint">Shown in KOReader: Settings → Network → MCP Server</p>
             </div>
             `}
 
@@ -251,7 +251,6 @@ app.get("/authorize", async (c) => {
             </div>
 
             <div class="actions">
-              <button type="button" class="cancel" onclick="window.close()">Cancel</button>
               <button type="submit" class="connect">Connect</button>
             </div>
           </form>
