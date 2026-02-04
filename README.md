@@ -4,7 +4,7 @@ A secure HTTP long-polling relay that enables remote access to KOReader MCP serv
 
 ## Features
 
-- **OAuth 2.0 Authentication**: Secure access with device-generated passcodes
+- **OAuth 2.1 Authentication (Authorization Code + PKCE)**: Secure access with device-generated passcodes
 - **MCP Authorization Compliant**: Implements RFC 9728 Protected Resource Metadata
 - **HTTP Long-Polling**: Works with any HTTP client (no WebSocket required)
 - **Cloudflare Durable Objects**: Persistent device state and request queuing
@@ -134,13 +134,18 @@ Your relay will be available at: `https://mcp-relay.<your-subdomain>.workers.dev
 
 ## API Endpoints
 
+### `GET /`
+
+Returns relay info and available endpoints.
+
 ### OAuth Endpoints
 
-| Endpoint                                  | Method | Description                     |
-| ----------------------------------------- | ------ | ------------------------------- |
-| `/.well-known/oauth-protected-resource`   | GET    | Protected Resource Metadata     |
-| `/.well-known/oauth-authorization-server` | GET    | Authorization Server Metadata   |
-| `/oauth/token`                            | POST   | Token endpoint (password grant) |
+| Endpoint                                  | Method | Description                         |
+| ----------------------------------------- | ------ | ----------------------------------- |
+| `/authorize`                              | GET    | Authorization endpoint (login)      |
+| `/.well-known/oauth-protected-resource`   | GET    | Protected Resource Metadata         |
+| `/.well-known/oauth-authorization-server` | GET    | Authorization Server Metadata       |
+| `/oauth/token`                            | POST   | Token endpoint (auth code exchange) |
 
 ### Device Endpoints (used by KOReader)
 

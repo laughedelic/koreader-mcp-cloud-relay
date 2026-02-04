@@ -64,17 +64,19 @@ interface PollWaiter {
  * MCPRelay Durable Object
  * 
  * Each instance handles one device's connection via HTTP long-polling.
- * Implements OAuth 2.0 password grant for MCP client authentication.
+ * MCP client authentication uses OAuth 2.1 Authorization Code flow with PKCE
+ * (handled by the OAuthProvider in index.ts).
  * 
  * Flow:
  * 1. Device generates deviceId + passcode locally
  * 2. Device calls /register with deviceId + passcodeHash
  * 3. Device calls /poll in a loop (long-polling, 30s timeout)
- * 4. MCP client gets token via /oauth/token using deviceId + passcode
- * 5. MCP client calls /mcp with Bearer token to send requests
- * 6. Relay queues request or delivers to waiting poll
- * 7. Device sends response via /response
- * 8. Relay delivers response to waiting MCP client
+ * 4. MCP client starts OAuth auth code flow (GET /authorize) and user enters device ID + passcode
+ * 5. MCP client exchanges auth code at /oauth/token for an access token
+ * 6. MCP client calls /mcp with Bearer token to send requests
+ * 7. Relay queues request or delivers to waiting poll
+ * 8. Device sends response via /response
+ * 9. Relay delivers response to waiting MCP client
  */
 export class MCPRelay implements DurableObject {
   private state: DurableObjectState;
