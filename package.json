@@ -21,5 +21,9 @@
     "koreader"
   ],
   "author": "laughedelic",
-  "license": "AGPL-3.0"
+  "license": "AGPL-3.0",
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.2.2",
+    "hono": "^4.11.7"
+  }
 }

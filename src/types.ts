@@ -4,7 +4,8 @@
 
 export interface RegisterMessage {
   type?: "register";      // Optional since it's implied by endpoint
-  deviceId?: string;      // Reuse previous ID for reconnection
+  deviceId: string;       // Device-generated ID (required)
+  passcodeHash: string;   // SHA-256 hash of the passcode (required for first registration)
   deviceName?: string;    // Human-readable name (e.g., "My Kindle")
   version?: string;       // Plugin version
 }
@@ -15,6 +16,23 @@ export interface ResponseMessage {
   status: number;
   headers?: Record<string, string>;
   body: string;           // JSON string (the MCP response)
+}
+
+// ============================================
+// OAuth Types
+// ============================================
+
+export interface OAuthError {
+  error: string;
+  error_description?: string;
+}
+
+export interface ProtectedResourceMetadata {
+  resource: string;
+  authorization_servers: string[];
+  scopes_supported: string[];
+  bearer_methods_supported: string[];
+  resource_documentation?: string;
 }
 
 // ============================================
@@ -57,6 +75,9 @@ export interface DeviceInfo {
   connectedAt: number;
   lastActivity: number;
   version?: string;
+  // OAuth credentials (device sends hash during registration)
+  passcodeHash?: string;
+  registeredAt?: number;
 }
 
 // ============================================
@@ -82,4 +103,6 @@ export interface ErrorResponse {
 
 export interface Env {
   MCP_RELAY: DurableObjectNamespace;
+  // KV namespace for OAuth state (tokens, clients, authorization codes)
+  OAUTH_KV: KVNamespace;
 }

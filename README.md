@@ -1,14 +1,17 @@
 # MCP Relay for Cloudflare Workers
 
-A lightweight HTTP long-polling relay that enables remote access to KOReader MCP servers from anywhere. This service bridges the gap between your e-reader and MCP clients like Claude Desktop or Claude Mobile.
+A secure HTTP long-polling relay that enables remote access to KOReader MCP servers from anywhere. This service bridges the gap between your e-reader and MCP clients like Claude Desktop or Claude Mobile.
+
+## Features
+
+- **OAuth 2.0 Authentication**: Secure access with device-generated passcodes
+- **MCP Authorization Compliant**: Implements RFC 9728 Protected Resource Metadata
+- **HTTP Long-Polling**: Works with any HTTP client (no WebSocket required)
+- **Cloudflare Durable Objects**: Persistent device state and request queuing
+- **Device-Based IDs**: IDs derived from your device model (e.g., `KoboClara-abc1`)
+- **Zero-Knowledge Passcode**: Passcode is generated and hashed on-device, never sent in plaintext
 
 ## How It Works
-
-1. Your e-reader registers with the relay and receives a public URL
-2. The device polls for incoming MCP requests (long-polling with 30s timeout)
-3. MCP clients (Claude, etc.) send HTTP requests to the device's public URL
-4. The relay queues requests and delivers them when the device polls
-5. The device processes requests locally and sends responses back
 
 ```mermaid
 sequenceDiagram
@@ -16,40 +19,86 @@ sequenceDiagram
   participant R as MCP Relay (Cloudflare)
   participant C as Client (Claude / MCP)
 
-  Note over D,R: 1) Device registers → gets public URL
-  D->>R: POST /{deviceId}/register
-  R-->>D: 200 OK (relayUrl, deviceId)
+  Note over D: Generate deviceId + passcode locally
+  Note over D: Hash passcode with SHA-256
 
-  Note over D,R: 2) Device opens long-poll (30s)
+  Note over D,R: 1) Device registration
+  D->>R: POST /register (passcodeHash)
+  R-->>D: 200 OK (relayUrl, tokenEndpoint)
+  Note over D: Display passcode to user
+
+  Note over C,R: 2) Client authenticates via OAuth
+  C->>R: GET /authorize (login UI)
+  C->>R: POST /oauth/token (auth code exchange)
+  R-->>C: 200 OK (access_token)
+
+  Note over D,R: 3) Device polls for requests
   loop Long-poll cycle
-    D->>R: GET /{deviceId}/poll (long-poll, 30s)
+    D->>R: GET /poll
     alt Request available
-      C->>R: POST /{deviceId}/mcp (MCP request)
-      R-->>D: 200 OK ({type:request,requestId,method,body})
+      C->>R: POST /mcp (Authorization: Bearer token)
+      R->>R: Validate access token
+      R-->>D: 200 OK ({type:request})
       Note over D: Process request locally
-      D->>R: POST /{deviceId}/response ({requestId,status,body})
+      D->>R: POST /response
       R-->>C: 200 OK (MCP response)
-      R-->>D: 200 OK (ack)
-    else Timeout / no requests
+    else Timeout
       R-->>D: 200 OK ({type:ping})
     end
   end
-
-  Note over D,R: Optional keep-alive
-  D->>R: POST /{deviceId}/pong (update last activity)
-
-  Note over C,R: Client checks device status
-  C->>R: GET /{deviceId}/status
-  R-->>C: 200 OK (online/offline)
 ```
 
-### Why HTTP Long-Polling?
+## Authentication Flow
 
-KOReader uses LuaSocket which doesn't have native WebSocket support. HTTP long-polling provides:
-- **Compatibility**: Works with any HTTP client
-- **Simplicity**: No complex connection state management
-- **Battery efficiency**: Adaptive polling intervals (0.5s - 5s)
-- **Reliability**: Automatic reconnection on network issues
+### 1. Device Registration
+
+When a device registers, it **generates credentials locally** (deviceId from device model + suffix, random 6-digit passcode) and sends only the SHA-256 hash of the passcode to the relay:
+
+```bash
+# Device generates: deviceId="KoboClara-abc1", passcode="123456"
+# Device computes: passcodeHash=SHA256("123456")
+
+curl -X POST https://mcp-relay.example.com/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "deviceId": "KoboClara-abc1",
+    "deviceName": "My Kobo",
+    "passcodeHash": "8d969eef6ecad3c29a3a629280e686cf...",
+    "version": "2.0.0"
+  }'
+
+# Response:
+{
+  "type": "registered",
+  "deviceId": "KoboClara-abc1",
+  "relayUrl": "https://mcp-relay.example.com/mcp",
+  "tokenEndpoint": "https://mcp-relay.example.com/oauth/token"
+}
+```
+
+The passcode is displayed to the user on their device. They need to enter it in their MCP client (Claude Desktop, etc.) for authentication.
+
+### 2. Getting an Access Token
+
+MCP clients authenticate using OAuth 2.1 Authorization Code flow with PKCE.
+
+### 3. Making Authenticated MCP Requests
+
+Include the access token in the `Authorization` header:
+
+```bash
+curl -X POST https://mcp-relay.example.com/mcp \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc": "2.0", "method": "resources/list", "id": 1}'
+```
+
+### OAuth Metadata Endpoints
+
+The relay implements RFC 9728 Protected Resource Metadata:
+
+- `/mcp/.well-known/oauth-protected-resource` - Protected resource metadata
+- `/.well-known/oauth-authorization-server` - Authorization server metadata
 
 ## Deployment
 
@@ -70,7 +119,13 @@ KOReader uses LuaSocket which doesn't have native WebSocket support. HTTP long-p
     bun run wrangler login
     ```
 
-3. Deploy
+3. (Optional) Set a JWT secret for token signing
+    ```bash
+    bun run wrangler secret put JWT_SECRET
+    # Enter a random string when prompted
+    ```
+
+4. Deploy
     ```bash
     bun run wrangler deploy
     ```
@@ -79,123 +134,69 @@ Your relay will be available at: `https://mcp-relay.<your-subdomain>.workers.dev
 
 ## API Endpoints
 
-### `GET /`
-Returns relay info and available endpoints.
+### OAuth Endpoints
+
+| Endpoint                                  | Method | Description                     |
+| ----------------------------------------- | ------ | ------------------------------- |
+| `/.well-known/oauth-protected-resource`   | GET    | Protected Resource Metadata     |
+| `/.well-known/oauth-authorization-server` | GET    | Authorization Server Metadata   |
+| `/oauth/token`                            | POST   | Token endpoint (password grant) |
 
 ### Device Endpoints (used by KOReader)
 
-| Endpoint               | Method | Description                          |
-| ---------------------- | ------ | ------------------------------------ |
-| `/{deviceId}/register` | POST   | Register device and get public URL   |
-| `/{deviceId}/poll`     | GET    | Long-poll for incoming MCP requests  |
-| `/{deviceId}/response` | POST   | Send response to a forwarded request |
-| `/{deviceId}/pong`     | POST   | Keep-alive heartbeat (optional)      |
+| Endpoint    | Method | Description                          |
+| ----------- | ------ | ------------------------------------ |
+| `/register` | POST   | Register device with passcode hash   |
+| `/poll`     | GET    | Long-poll for incoming MCP requests  |
+| `/response` | POST   | Send response to a forwarded request |
+| `/pong`     | POST   | Keep-alive heartbeat (optional)      |
+
+All device endpoints require the `X-Device-Id` header (except `/register`, which includes `deviceId` in the JSON body).
 
 ### Client Endpoints (used by Claude/MCP clients)
 
-| Endpoint             | Method | Description                |
-| -------------------- | ------ | -------------------------- |
-| `/{deviceId}/mcp`    | POST   | Send MCP request to device |
-| `/{deviceId}/status` | GET    | Check if device is online  |
-
-## Protocol
-
-### Device Registration
-
-```mermaid
-sequenceDiagram
-  participant D as Device (KOReader)
-  participant R as Relay
-
-  D->>R: POST /{deviceId}/register
-  Note over D,R: {"deviceId": "abc123xyz456",<br/>"deviceName": "My Kindle",<br/>"version": "1.0.0"}
-  R-->>D: 200 OK
-  Note over D,R: {"type": "registered",<br/>"deviceId": "abc123xyz456",<br/>"relayUrl": "https://..."}
-```
-
-### Polling for Requests
-
-```mermaid
-sequenceDiagram
-  participant D as Device (KOReader)
-  participant R as Relay
-  participant C as Client (Claude)
-
-  D->>R: GET /{deviceId}/poll
-  Note over D,R: Long-poll connection (30s timeout)
-  
-  alt Request available
-    C->>R: POST /{deviceId}/mcp (MCP request)
-    R-->>D: 200 OK
-    Note over D,R: {"type": "request",<br/>"requestId": "req-...",<br/>"method": "POST",<br/>"body": "..."}
-  else Timeout (no requests)
-    R-->>D: 200 OK
-    Note over D,R: {"type": "ping"}
-  end
-```
-
-### Sending Response
-
-```mermaid
-sequenceDiagram
-  participant D as Device (KOReader)
-  participant R as Relay
-  participant C as Client (Claude)
-
-  C->>R: POST /{deviceId}/mcp (MCP request)
-  Note over R: Request queued
-  D->>R: GET /{deviceId}/poll
-  R-->>D: Request details
-  Note over D: Process MCP request
-  D->>R: POST /{deviceId}/response
-  Note over D,R: {"type": "response",<br/>"requestId": "req-...",<br/>"status": 200,<br/>"body": "..."}
-  R-->>D: 200 OK
-  R-->>C: 200 OK (MCP response)
-```
-
-### Keep-Alive (Optional)
-
-**Request:** `POST /{deviceId}/pong`
-
-The device can send pong to update its last activity timestamp without waiting for a full poll cycle.
-
-## Timeouts and Configuration
-
-| Parameter        | Value    | Description                                      |
-| ---------------- | -------- | ------------------------------------------------ |
-| Poll timeout     | 30s      | How long the relay waits before returning `ping` |
-| Request timeout  | 30s      | How long client waits for device response        |
-| Session timeout  | 2min     | Device considered offline after no activity      |
-| Device ID length | 12 chars | Alphanumeric, lowercase                          |
-
-### Client-side (KOReader) Adaptive Polling
-
-The KOReader client uses adaptive polling intervals:
-- **Active**: 0.5s between polls (when recently handling requests)
-- **Idle**: Up to 5s between polls (battery saving mode)
-
-## Custom Domain (Optional)
-
-To use a custom domain like `mcp.yourdomain.com`:
-
-1. Add your domain to Cloudflare
-2. Update the route in `wrangler.toml`:
-   ```toml
-   [[routes]]
-   pattern = "mcp.yourdomain.com/*"
-   custom_domain = true
-   ```
-3. Redeploy: `npx wrangler deploy`
+| Endpoint  | Method | Description                                                                    |
+| --------- | ------ | ------------------------------------------------------------------------------ |
+| `/mcp`    | POST   | Send MCP request (requires Bearer token)                                       |
+| `/status` | GET    | Check if device is online (requires `X-Device-Id` header or `device_id` query) |
 
 ## Security
 
-- **Device ID as secret**: The 12-character device ID acts as a bearer token. Anyone with the ID can send requests to your device.
-- **All traffic encrypted**: HTTPS for all communication.
-- **No stored content**: The relay doesn't persist MCP request/response content, only device registration data.
+### Passcode Security
+
+- **Device-generated**: Passcode is generated and displayed only on the device
+- **Zero-knowledge**: Relay only receives and stores the SHA-256 hash
+- **Never transmitted in plaintext**: The actual passcode never leaves the device
+- **Re-registration verification**: Reconnections must provide matching passcode hash
+
+### Token Security
+
+- **Short-lived tokens**: Access tokens expire in 1 hour
+- **Audience validation**: Tokens are bound to the relay resource
+
+### Best Practices
+
+Following [MCP Security Best Practices](https://modelcontextprotocol.io/specification/2025-11-25/basic/security_best_practices.md):
+
+- ✅ HTTPS for all communication
+- ✅ Token audience validation
+- ✅ No token passthrough
+- ✅ Proper `WWW-Authenticate` challenges with `resource_metadata`
+- ✅ Short-lived access tokens
+- ✅ Secure credential storage (hashed passcodes)
+
+## Configuration
+
+| Parameter        | Value          | Description                                      |
+| ---------------- | -------------- | ------------------------------------------------ |
+| Poll timeout     | 30s            | How long the relay waits before returning `ping` |
+| Request timeout  | 30s            | How long client waits for device response        |
+| Session timeout  | 2min           | Device considered offline after no activity      |
+| Token expiry     | 1 hour         | How long access tokens are valid                 |
+| Device ID format | `{model}-xxxx` | Device model + 4-char random suffix              |
+| Passcode format  | 6 digits       | Random numeric passcode                          |
 
 ## Cost Estimation (Cloudflare Free Tier)
-
-Casual usage should fit within Cloudflare's free tier limits:
 
 | Resource                | Free Tier Limit | Expected Usage |
 | ----------------------- | --------------- | -------------- |

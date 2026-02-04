@@ -5,6 +5,7 @@ import {
   DeviceInfo,
   RequestMessage,
   StatusResponse,
+  OAuthError,
 } from "./types";
 
 // Timeouts in milliseconds
@@ -17,6 +18,26 @@ const SESSION_TIMEOUT = 120000; // 2 minutes - device considered offline after t
  */
 function generateRequestId(): string {
   return `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Hash a passcode using SHA-256 (used to verify device-provided hashes)
+ * The device sends a hash, we verify by hashing the provided passcode the same way
+ */
+async function hashPasscode(passcode: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(passcode);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Verify a passcode against its stored hash
+ */
+async function verifyPasscode(passcode: string, storedHash: string): Promise<boolean> {
+  const computedHash = await hashPasscode(passcode);
+  return computedHash === storedHash;
 }
 
 /**
@@ -43,14 +64,17 @@ interface PollWaiter {
  * MCPRelay Durable Object
  * 
  * Each instance handles one device's connection via HTTP long-polling.
+ * Implements OAuth 2.0 password grant for MCP client authentication.
  * 
  * Flow:
- * 1. Device calls /register to announce itself and get its public URL
- * 2. Device calls /poll in a loop (long-polling, 30s timeout)
- * 3. MCP client calls /mcp to send requests
- * 4. Relay queues request or delivers to waiting poll
- * 5. Device sends response via /response
- * 6. Relay delivers response to waiting MCP client
+ * 1. Device generates deviceId + passcode locally
+ * 2. Device calls /register with deviceId + passcodeHash
+ * 3. Device calls /poll in a loop (long-polling, 30s timeout)
+ * 4. MCP client gets token via /oauth/token using deviceId + passcode
+ * 5. MCP client calls /mcp with Bearer token to send requests
+ * 6. Relay queues request or delivers to waiting poll
+ * 7. Device sends response via /response
+ * 8. Relay delivers response to waiting MCP client
  */
 export class MCPRelay implements DurableObject {
   private state: DurableObjectState;
@@ -78,7 +102,7 @@ export class MCPRelay implements DurableObject {
    */
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    this.baseUrl = `${url.protocol}//${url.host}`;
+    this.baseUrl = request.headers.get("X-Relay-Base-URL") || `${url.protocol}//${url.host}`;
     
     const pathParts = url.pathname.split("/").filter(Boolean);
     const action = pathParts[1] || "";
@@ -119,6 +143,12 @@ export class MCPRelay implements DurableObject {
         return request.method === "GET"
           ? this.handleStatus()
           : this.methodNotAllowed();
+
+      // Internal endpoint for OAuth authorization flow
+      case "verify-passcode":
+        return request.method === "POST"
+          ? this.handleVerifyPasscode(request)
+          : this.methodNotAllowed();
           
       default:
         return this.notFound();
@@ -130,7 +160,10 @@ export class MCPRelay implements DurableObject {
   // ============================================
 
   /**
-   * POST /register - Device announces itself
+   * POST /register - Device announces itself with device-generated credentials
+   * 
+   * First registration: device provides deviceId + passcodeHash
+   * Re-registration: device provides same deviceId + passcodeHash (must match stored)
    */
   private async handleRegister(request: Request): Promise<Response> {
     let body: RegisterMessage;
@@ -140,26 +173,88 @@ export class MCPRelay implements DurableObject {
       return this.jsonError("Invalid JSON", "PARSE_ERROR", 400);
     }
 
-    const deviceId = body.deviceId || this.generateDeviceId();
+    // Device ID is required and must be provided by the device
+    if (!body.deviceId) {
+      return this.jsonError("deviceId is required", "MISSING_DEVICE_ID", 400);
+    }
 
+    const normalizedDeviceId = body.deviceId.toLowerCase();
+
+    const isReconnection = !!this.deviceInfo;
+    
+    // On first registration, passcodeHash is required
+    if (!isReconnection && !body.passcodeHash) {
+      return this.jsonError("passcodeHash is required for first registration", "MISSING_PASSCODE_HASH", 400);
+    }
+    
+    // On reconnection, verify the passcode hash matches
+    if (isReconnection && this.deviceInfo?.passcodeHash) {
+      // If a passcodeHash is provided, it must match
+      if (body.passcodeHash && body.passcodeHash !== this.deviceInfo.passcodeHash) {
+        return this.jsonError("Passcode hash mismatch", "INVALID_PASSCODE", 401);
+      }
+    }
+
+    // Store or update device info
+    const passcodeHash = body.passcodeHash || this.deviceInfo?.passcodeHash;
+    
     this.deviceInfo = {
-      deviceId,
-      deviceName: body.deviceName,
-      connectedAt: Date.now(),
+      deviceId: normalizedDeviceId,
+      deviceName: body.deviceName || this.deviceInfo?.deviceName,
+      connectedAt: this.deviceInfo?.connectedAt || Date.now(),
       lastActivity: Date.now(),
       version: body.version,
+      passcodeHash,
+      registeredAt: this.deviceInfo?.registeredAt || Date.now(),
     };
     this.lastPollTime = Date.now();
 
     await this.state.storage.put("deviceInfo", this.deviceInfo);
 
-    console.log(`Device registered: ${deviceId} (${body.deviceName || "unnamed"})`);
+    console.log(`Device registered: ${normalizedDeviceId} (${body.deviceName || "unnamed"})${!isReconnection ? " [FIRST TIME]" : ""}`);
 
-    return this.jsonResponse({
+    const response: Record<string, unknown> = {
       type: "registered",
-      deviceId,
-      relayUrl: `${this.baseUrl}/${deviceId}/mcp`,
-    });
+      deviceId: normalizedDeviceId,
+      relayUrl: `${this.baseUrl}/mcp`,
+      tokenEndpoint: `${this.baseUrl}/oauth/token`,
+    };
+    
+    if (!isReconnection) {
+      response.message = "Device registered successfully. Use the passcode you generated to authenticate MCP clients.";
+    }
+
+    return this.jsonResponse(response);
+  }
+
+  /**
+   * POST /verify-passcode - Internal endpoint for OAuth authorization
+   * Called by the auth handler to verify device passcode during OAuth flow
+   * Returns 200 OK if valid, 401 if invalid
+   */
+  private async handleVerifyPasscode(request: Request): Promise<Response> {
+    let body: { passcode: string };
+    try {
+      body = await request.json();
+    } catch {
+      return this.jsonResponse({ valid: false, error: "Invalid JSON" }, 400);
+    }
+
+    if (!this.deviceInfo) {
+      return this.jsonResponse({ valid: false, error: "Device not registered" }, 401);
+    }
+
+    if (!this.deviceInfo.passcodeHash) {
+      return this.jsonResponse({ valid: false, error: "Device has no credentials" }, 401);
+    }
+
+    // Verify the provided passcode by hashing and comparing
+    const valid = await verifyPasscode(body.passcode, this.deviceInfo.passcodeHash);
+    if (!valid) {
+      return this.jsonResponse({ valid: false, error: "Invalid passcode" }, 401);
+    }
+
+    return this.jsonResponse({ valid: true });
   }
 
   /**
@@ -257,8 +352,23 @@ export class MCPRelay implements DurableObject {
 
   /**
    * POST /mcp - MCP client sends request to device
+   * 
+   * Authentication is handled by the OAuthProvider in index.ts.
+   * Requests that reach this handler are already authenticated.
    */
   private async handleMCPRequest(request: Request): Promise<Response> {
+    // Check if this request was pre-authenticated by the OAuthProvider
+    const oauthAuthenticated = request.headers.get("X-OAuth-Authenticated") === "true";
+    
+    // If the device has credentials configured, require OAuth authentication
+    if (this.deviceInfo?.passcodeHash && !oauthAuthenticated) {
+      // Return 401 with WWW-Authenticate header per RFC 9728
+      return this.unauthorizedResponse(
+        "Bearer token required",
+        `${this.baseUrl}/${this.deviceInfo?.deviceId || "unknown"}/.well-known/oauth-protected-resource`
+      );
+    }
+
     if (!this.isDeviceOnline()) {
       return this.jsonResponse({
         jsonrpc: "2.0",
@@ -338,13 +448,6 @@ export class MCPRelay implements DurableObject {
     return (Date.now() - this.lastPollTime) < SESSION_TIMEOUT;
   }
 
-  private generateDeviceId(): string {
-    const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-    const values = new Uint8Array(12);
-    crypto.getRandomValues(values);
-    return Array.from(values, v => chars[v % chars.length]).join("");
-  }
-
   private removeWaiter(resolve: (req: QueuedRequest | null) => void): void {
     const idx = this.pollWaiters.findIndex(w => w.resolve === resolve);
     if (idx >= 0) this.pollWaiters.splice(idx, 1);
@@ -359,6 +462,34 @@ export class MCPRelay implements DurableObject {
 
   private jsonError(message: string, code: string, status: number): Response {
     return this.jsonResponse({ error: message, code }, status);
+  }
+
+  private oauthError(error: string, description: string, status: number): Response {
+    return this.corsResponse(new Response(JSON.stringify({ 
+      error, 
+      error_description: description 
+    }), {
+      status,
+      headers: { 
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+      },
+    }));
+  }
+
+  private unauthorizedResponse(message: string, resourceMetadataUrl: string): Response {
+    return this.corsResponse(new Response(JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code: -32000, message },
+      id: null,
+    }), {
+      status: 401,
+      headers: {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": `Bearer realm="mcp", resource_metadata="${resourceMetadataUrl}", scope="mcp:access"`,
+      },
+    }));
   }
 
   private notFound(): Response {
