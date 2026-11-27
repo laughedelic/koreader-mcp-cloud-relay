@@ -359,7 +359,17 @@ export class MCPRelay implements DurableObject {
 
     await this.state.storage.put("deviceInfo", this.deviceInfo);
 
-    console.log(`Device registered: ${normalizedDeviceId} (${body.deviceName || "unnamed"})${!isReconnection ? " [FIRST TIME]" : ""}`);
+    // One structured line per registration, so Workers Logs can count devices
+    // that still connect without a secret (see README: REQUIRE_DEVICE_SECRET)
+    console.log(JSON.stringify({
+      event: "register",
+      deviceId: normalizedDeviceId,
+      firstTime: !isReconnection,
+      hasSecret: !!deviceSecretHash,
+      sentSecret: !!providedSecretHash,
+      pluginVersion: typeof body.version === "string" ? body.version.slice(0, 32) : null,
+      userAgent: (request.headers.get("User-Agent") || "").slice(0, 100),
+    }));
 
     const response: Record<string, unknown> = {
       type: "registered",
