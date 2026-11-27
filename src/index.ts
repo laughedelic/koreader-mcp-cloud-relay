@@ -146,10 +146,88 @@ const oauthProvider = new OAuthProvider({
   },
 });
 
+/**
+ * RFC 9728 Protected Resource Metadata for the /mcp endpoint.
+ *
+ * Served here, before the OAuth provider, because the provider treats every
+ * path under its apiRoute ("/mcp") as protected and would answer
+ * /mcp/.well-known/... with 401. Available at the RFC 9728 location
+ * (/.well-known/oauth-protected-resource/mcp), the root location, and the
+ * legacy /mcp/.well-known/oauth-protected-resource path.
+ */
+const PROTECTED_RESOURCE_METADATA_PATHS = new Set([
+  "/.well-known/oauth-protected-resource/mcp",
+  "/.well-known/oauth-protected-resource",
+  "/mcp/.well-known/oauth-protected-resource",
+]);
+
+function protectedResourceMetadataUrl(origin: string): string {
+  return `${origin}/.well-known/oauth-protected-resource/mcp`;
+}
+
+function protectedResourceMetadata(origin: string): Response {
+  return new Response(JSON.stringify({
+    // The origin, not `${origin}/mcp`: clients put this in the OAuth `resource`
+    // parameter, it becomes the token's audience, and workers-oauth-provider
+    // 0.2.x accepts only an audience equal to the request origin. MCP clients
+    // accept a resource that is a prefix of the server URL. Switch to the /mcp
+    // URL after upgrading to a provider with path-aware audience matching (1.x).
+    resource: origin,
+    authorization_servers: [origin],
+    scopes_supported: ["mcp:access"],
+    bearer_methods_supported: ["header"],
+  }), {
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=3600",
+    },
+  });
+}
+
+/**
+ * Give /mcp auth failures an absolute resource_metadata URL (onError has no
+ * access to the request origin) and let browser clients read the challenge.
+ */
+function finalizeMcpAuthResponse(response: Response, origin: string): Response {
+  if (response.status !== 401) return response;
+  const headers = new Headers(response.headers);
+  const challenge = headers.get("WWW-Authenticate");
+  if (challenge) {
+    headers.set("WWW-Authenticate",
+      challenge.replace(/resource_metadata="[^"]*"/, `resource_metadata="${protectedResourceMetadataUrl(origin)}"`));
+  } else {
+    headers.set("WWW-Authenticate",
+      `Bearer realm="mcp", resource_metadata="${protectedResourceMetadataUrl(origin)}"`);
+  }
+  headers.set("Access-Control-Allow-Origin", headers.get("Access-Control-Allow-Origin") || "*");
+  headers.set("Access-Control-Expose-Headers", "WWW-Authenticate");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const pathname = url.pathname;
+
+    if (PROTECTED_RESOURCE_METADATA_PATHS.has(pathname) && (request.method === "GET" || request.method === "HEAD")) {
+      return protectedResourceMetadata(url.origin);
+    }
+
+    // CORS preflights for the root device endpoints: answered here, since
+    // they carry no device ID to route by and would otherwise reach OAuth
+    if (request.method === "OPTIONS" &&
+        ["/register", "/poll", "/pong", "/response", "/status"].includes(pathname)) {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Device-Id",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
 
     // Device endpoints are now root-level and identified by X-Device-Id
     if (pathname === "/register" && request.method === "POST") {
@@ -171,6 +249,7 @@ export default {
         forwardUrl.pathname = `/${deviceId}/register`;
 
         const headers = new Headers(request.headers);
+        headers.delete("X-OAuth-Authenticated");
         headers.set("X-Relay-Base-URL", url.origin);
 
         return stub.fetch(new Request(forwardUrl.toString(), {
@@ -207,6 +286,7 @@ export default {
       forwardUrl.pathname = `/${deviceId}${pathname}`;
 
       const headers = new Headers(request.headers);
+      headers.delete("X-OAuth-Authenticated");
       headers.set("X-Relay-Base-URL", url.origin);
 
       return stub.fetch(new Request(forwardUrl.toString(), {
@@ -216,6 +296,10 @@ export default {
       }));
     }
 
-    return oauthProvider.fetch(request, env, ctx);
+    const response = await oauthProvider.fetch(request, env, ctx);
+    if (pathname === "/mcp" || pathname.startsWith("/mcp/")) {
+      return finalizeMcpAuthResponse(response, url.origin);
+    }
+    return response;
   },
 };

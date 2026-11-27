@@ -8,6 +8,11 @@ compatibility_flags = ["nodejs_compat"]
 binding = "OAUTH_KV"
 id = "e78c23710e5e4623813036dcbc5b251a"
 
+# Set to "true" once all devices run a plugin version that registers a device
+# secret; until then, legacy devices without a secret can still poll.
+[vars]
+REQUIRE_DEVICE_SECRET = "false"
+
 # Durable Objects binding
 [[durable_objects.bindings]]
 name = "MCP_RELAY"
