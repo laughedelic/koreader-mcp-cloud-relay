@@ -214,6 +214,21 @@ export default {
       return protectedResourceMetadata(url.origin);
     }
 
+    // CORS preflights for the root device endpoints: answered here, since
+    // they carry no device ID to route by and would otherwise reach OAuth
+    if (request.method === "OPTIONS" &&
+        ["/register", "/poll", "/pong", "/response", "/status"].includes(pathname)) {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Device-Id",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
     // Device endpoints are now root-level and identified by X-Device-Id
     if (pathname === "/register" && request.method === "POST") {
       let bodyText = "";

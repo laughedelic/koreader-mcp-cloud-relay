@@ -300,7 +300,24 @@ export class MCPRelay implements DurableObject {
         // (an absent hash used to be accepted, which let anyone re-register the device).
         // A 6-digit passcode's hash is guessable, so this shares the login lockout.
         const lockout = await this.checkPasscodeLockout();
-        if (lockout) return lockout;
+        if (lockout) {
+          if (!providedSecretHash) {
+            // A plain legacy reconnect during a lockout: answer as registered
+            // without checking or changing anything. Old plugins only start
+            // polling after a successful registration, and their polls aren't
+            // authenticated anyway, so this keeps an attacker's wrong guesses
+            // from taking the device offline. The same answer for every hash
+            // reveals nothing; secret upgrades stay throttled below.
+            return this.jsonResponse({
+              type: "registered",
+              deviceId: normalizedDeviceId,
+              relayUrl: `${this.baseUrl}/mcp`,
+              tokenEndpoint: `${this.baseUrl}/oauth/token`,
+              deviceSecretRegistered: false,
+            });
+          }
+          return lockout;
+        }
         if (!body.passcodeHash || !timingSafeEqual(body.passcodeHash, this.deviceInfo.passcodeHash)) {
           await this.recordPasscodeFailure();
           return this.jsonError("Passcode hash mismatch", "INVALID_PASSCODE", 401);
@@ -536,6 +553,12 @@ export class MCPRelay implements DurableObject {
       return this.jsonError("Invalid JSON", "PARSE_ERROR", 400);
     }
 
+    // Authenticate again now that the body is in: a secret may have been
+    // installed while it was being sent, and a legacy device's response
+    // admitted before that must not resolve a request
+    const authError = await this.authenticateDevice(request);
+    if (authError) return authError;
+
     const pending = this.pendingRequests.get(body.requestId);
     if (!pending) {
       // Not an error - request may have timed out
@@ -734,8 +757,8 @@ export class MCPRelay implements DurableObject {
     headers.set("Access-Control-Allow-Origin", "*");
     headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     headers.set("Access-Control-Allow-Headers",
-      "Content-Type, Authorization, Accept, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id, Last-Event-ID");
-    headers.set("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id");
+      "Content-Type, Authorization, Accept, X-Device-Id, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id, Last-Event-ID");
+    headers.set("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id, Allow");
     headers.set("Access-Control-Max-Age", "86400");
     return new Response(response.body, {
       status: response.status,
