@@ -525,15 +525,32 @@ app.all("/:deviceId/*", async (c) => {
     }, 400);
   }
 
+  const url = new URL(c.req.url);
+  const action = url.pathname.split("/").filter(Boolean)[1] || "";
+
+  // The per-device MCP path is not an OAuth-protected route, so it can't be
+  // served here: MCP clients must use the unified /mcp endpoint.
+  if (action === "mcp") {
+    return c.json({
+      jsonrpc: "2.0",
+      error: { code: -32600, message: `Use ${url.origin}/mcp as the MCP server URL` },
+      id: null,
+    }, 404);
+  }
+
+  // Internal-only endpoints are never reachable from outside
+  if (action === "verify-passcode") {
+    return c.json({ error: { code: "NOT_FOUND", message: "Not Found" } }, 404);
+  }
+
   // Get Durable Object for this device
   const doId = c.env.MCP_RELAY.idFromName(deviceId);
   const stub = c.env.MCP_RELAY.get(doId);
 
   // Forward request to Durable Object
-  const url = new URL(c.req.url);
-  
-  // Add headers for DO
+  // Add headers for DO; never pass through a client-supplied authentication marker
   const headers = new Headers(c.req.raw.headers);
+  headers.delete("X-OAuth-Authenticated");
   headers.set("X-Relay-Base-URL", url.origin);
 
   return stub.fetch(new Request(url.toString(), {

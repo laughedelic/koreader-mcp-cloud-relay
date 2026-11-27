@@ -64,6 +64,7 @@ curl -X POST https://mcp-relay.example.com/register \
     "deviceId": "KoboClara-abc1",
     "deviceName": "My Kobo",
     "passcodeHash": "8d969eef6ecad3c29a3a629280e686cf...",
+    "deviceSecret": "<64 random hex chars, generated on the device>",
     "version": "2.0.0"
   }'
 
@@ -72,7 +73,8 @@ curl -X POST https://mcp-relay.example.com/register \
   "type": "registered",
   "deviceId": "KoboClara-abc1",
   "relayUrl": "https://mcp-relay.example.com/mcp",
-  "tokenEndpoint": "https://mcp-relay.example.com/oauth/token"
+  "tokenEndpoint": "https://mcp-relay.example.com/oauth/token",
+  "deviceSecretRegistered": true
 }
 ```
 
@@ -158,12 +160,16 @@ Returns relay info and available endpoints.
 
 All device endpoints require the `X-Device-Id` header (except `/register`, which includes `deviceId` in the JSON body).
 
+`/poll`, `/response`, `/pong` and `/status` also require `Authorization: Device <deviceSecret>`, using the secret the device sent at registration. Re-registering a device that has a secret requires the same secret. Devices registered before device secrets existed can still poll without one, and upgrade by re-registering with a secret and their passcode hash; set `REQUIRE_DEVICE_SECRET = "true"` in `wrangler.toml` to stop accepting them.
+
 ### Client Endpoints (used by Claude/MCP clients)
 
 | Endpoint  | Method | Description                                                                    |
 | --------- | ------ | ------------------------------------------------------------------------------ |
 | `/mcp`    | POST   | Send MCP request (requires Bearer token)                                       |
-| `/status` | GET    | Check if device is online (requires `X-Device-Id` header or `device_id` query) |
+| `/status` | GET    | Check if device is online (device endpoint: requires `X-Device-Id` and the device secret) |
+
+Only protocol headers (`Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Mcp-Session-Id`, `Last-Event-ID`, `User-Agent`) are forwarded to the device. The client's `Authorization` header and cookies never leave the relay.
 
 ## Security
 
@@ -172,7 +178,13 @@ All device endpoints require the `X-Device-Id` header (except `/register`, which
 - **Device-generated**: Passcode is generated and displayed only on the device
 - **Zero-knowledge**: Relay only receives and stores the SHA-256 hash
 - **Never transmitted in plaintext**: The actual passcode never leaves the device
-- **Re-registration verification**: Reconnections must provide matching passcode hash
+- **Re-registration verification**: Reconnections must provide the matching device secret (or, for legacy devices, the matching passcode hash)
+- **Brute-force protection**: After 5 wrong passcodes, the device is locked for 1 minute, doubling with each further failure up to 1 hour
+
+### Device Security
+
+- **Device secret**: A random secret generated on the device authenticates its polling, so knowing a device ID is not enough to receive its requests
+- **Header allowlist**: Client credentials are never forwarded to the device
 
 ### Token Security
 

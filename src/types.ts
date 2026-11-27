@@ -8,6 +8,7 @@ export interface RegisterMessage {
   passcodeHash: string;   // SHA-256 hash of the passcode (required for first registration)
   deviceName?: string;    // Human-readable name (e.g., "My Kindle")
   version?: string;       // Plugin version
+  deviceSecret?: string;  // Random device-generated secret; required on /poll, /response, /pong once registered
 }
 
 export interface ResponseMessage {
@@ -77,6 +78,8 @@ export interface DeviceInfo {
   version?: string;
   // OAuth credentials (device sends hash during registration)
   passcodeHash?: string;
+  // SHA-256 of the device secret that authenticates /poll, /response, /pong
+  deviceSecretHash?: string;
   registeredAt?: number;
 }
 
@@ -105,4 +108,6 @@ export interface Env {
   MCP_RELAY: DurableObjectNamespace;
   // KV namespace for OAuth state (tokens, clients, authorization codes)
   OAUTH_KV: KVNamespace;
+  // "true" to reject devices that never registered a device secret
+  REQUIRE_DEVICE_SECRET?: string;
 }

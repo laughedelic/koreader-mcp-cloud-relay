@@ -13,11 +13,73 @@ const REQUEST_TIMEOUT = 30000;  // 30 seconds - how long client waits for device
 const POLL_TIMEOUT = 30000;     // 30 seconds - how long device poll blocks
 const SESSION_TIMEOUT = 120000; // 2 minutes - device considered offline after this
 
+// Passcode brute-force protection
+const MAX_FREE_PASSCODE_ATTEMPTS = 5;      // failures allowed before lockout kicks in
+const PASSCODE_LOCKOUT_BASE_MS = 60_000;   // first lockout: 1 minute, doubling each further failure
+const PASSCODE_LOCKOUT_MAX_MS = 3_600_000; // lockout capped at 1 hour
+
+// Request headers forwarded from the MCP client to the device.
+// Everything else (Authorization, Cookie, CF-* headers, ...) stays at the relay,
+// so a device can never see the client's OAuth token.
+const FORWARDED_REQUEST_HEADERS = [
+  "accept",
+  "content-type",
+  "mcp-protocol-version",
+  "mcp-method",
+  "mcp-name",
+  "mcp-session-id",
+  "last-event-id",
+  "user-agent",
+];
+
+// Response headers passed back from the device to the MCP client.
+const FORWARDED_RESPONSE_HEADERS = [
+  "content-type",
+  "mcp-session-id",
+  "allow",
+];
+
+// HTTP statuses that must not carry a body
+const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+
 /**
  * Generate a unique request ID
  */
 function generateRequestId(): string {
-  return `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `req-${crypto.randomUUID()}`;
+}
+
+/**
+ * Constant-time string comparison (for hashes of equal, known length)
+ */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/**
+ * Pick an allowlisted subset of headers (lowercased names)
+ */
+function pickHeaders(headers: Headers | Record<string, string> | undefined, allowed: string[]): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!headers) return result;
+  const get = headers instanceof Headers
+    ? (name: string) => headers.get(name)
+    : (name: string) => {
+        for (const [k, v] of Object.entries(headers)) {
+          if (k.toLowerCase() === name) return v;
+        }
+        return null;
+      };
+  for (const name of allowed) {
+    const value = get(name);
+    if (value !== null && value !== undefined) result[name] = value;
+  }
+  return result;
 }
 
 /**
@@ -37,7 +99,7 @@ async function hashPasscode(passcode: string): Promise<string> {
  */
 async function verifyPasscode(passcode: string, storedHash: string): Promise<boolean> {
   const computedHash = await hashPasscode(passcode);
-  return computedHash === storedHash;
+  return timingSafeEqual(computedHash, storedHash);
 }
 
 /**
@@ -58,6 +120,14 @@ interface QueuedRequest {
 interface PollWaiter {
   resolve: (req: QueuedRequest | null) => void;
   timeout: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Failed passcode verification tracking (persisted per device)
+ */
+interface PasscodeAttempts {
+  failures: number;
+  lockedUntil: number;
 }
 
 /**
@@ -91,8 +161,14 @@ export class MCPRelay implements DurableObject {
   private requestQueue: QueuedRequest[] = [];
   private pollWaiters: PollWaiter[] = [];
 
-  constructor(state: DurableObjectState, _env: unknown) {
+  // When true, devices that never registered a device secret are rejected
+  // on /poll, /response and /pong (set REQUIRE_DEVICE_SECRET="true" once
+  // all devices run a plugin version that sends one).
+  private requireDeviceSecret: boolean;
+
+  constructor(state: DurableObjectState, env: unknown) {
     this.state = state;
+    this.requireDeviceSecret = (env as { REQUIRE_DEVICE_SECRET?: string })?.REQUIRE_DEVICE_SECRET === "true";
     // Restore device info from storage
     this.state.blockConcurrencyWhile(async () => {
       this.deviceInfo = await this.state.storage.get("deviceInfo") || null;
@@ -114,33 +190,41 @@ export class MCPRelay implements DurableObject {
       return this.corsResponse(new Response(null, { status: 204 }));
     }
 
+    // Device-only endpoints require the device secret (see authenticateDevice)
+    if (["poll", "response", "pong", "status"].includes(action)) {
+      const authError = await this.authenticateDevice(request, action === "status");
+      if (authError) return authError;
+    }
+
     // Route to handlers
     switch (action) {
       case "register":
-        return request.method === "POST" 
+        return request.method === "POST"
           ? this.handleRegister(request)
           : this.methodNotAllowed();
-          
+
       case "poll":
         return request.method === "GET"
           ? this.handlePoll()
           : this.methodNotAllowed();
-          
+
       case "response":
         return request.method === "POST"
           ? this.handleResponse(request)
           : this.methodNotAllowed();
-          
+
       case "pong":
         return request.method === "POST"
           ? this.handlePong()
           : this.methodNotAllowed();
-          
+
       case "mcp":
+        // Streamable HTTP: this relay offers no standalone GET stream and no
+        // session deletion, so GET/DELETE get 405 with an Allow header.
         return request.method === "POST"
           ? this.handleMCPRequest(request)
-          : this.methodNotAllowed();
-          
+          : this.methodNotAllowed("POST");
+
       case "status":
         return request.method === "GET"
           ? this.handleStatus()
@@ -183,23 +267,43 @@ export class MCPRelay implements DurableObject {
     const normalizedDeviceId = body.deviceId.toLowerCase();
 
     const isReconnection = !!this.deviceInfo;
-    
+
+    if (body.deviceSecret !== undefined &&
+        (typeof body.deviceSecret !== "string" || body.deviceSecret.length < 32 || body.deviceSecret.length > 256)) {
+      return this.jsonError("deviceSecret must be a string of 32-256 characters", "INVALID_DEVICE_SECRET", 400);
+    }
+    const providedSecretHash = body.deviceSecret ? await hashPasscode(body.deviceSecret) : undefined;
+
     // On first registration, passcodeHash is required
     if (!isReconnection && !body.passcodeHash) {
       return this.jsonError("passcodeHash is required for first registration", "MISSING_PASSCODE_HASH", 400);
     }
-    
-    // On reconnection, verify the passcode hash matches
-    if (isReconnection && this.deviceInfo?.passcodeHash) {
-      // If a passcodeHash is provided, it must match
-      if (body.passcodeHash && body.passcodeHash !== this.deviceInfo.passcodeHash) {
+
+    if (isReconnection && this.deviceInfo) {
+      if (this.deviceInfo.deviceSecretHash) {
+        // Device has a secret: re-registration must prove it
+        if (!providedSecretHash || !timingSafeEqual(providedSecretHash, this.deviceInfo.deviceSecretHash)) {
+          return this.jsonError("Device secret mismatch", "INVALID_DEVICE_SECRET", 401);
+        }
+      } else if (this.deviceInfo.passcodeHash) {
+        // Legacy device without a secret: the passcode hash must be present and match
+        // (an absent hash used to be accepted, which let anyone re-register the device)
+        if (!body.passcodeHash || !timingSafeEqual(body.passcodeHash, this.deviceInfo.passcodeHash)) {
+          return this.jsonError("Passcode hash mismatch", "INVALID_PASSCODE", 401);
+        }
+      }
+      // Passcode can't be changed by re-registration
+      if (body.passcodeHash && this.deviceInfo.passcodeHash &&
+          !timingSafeEqual(body.passcodeHash, this.deviceInfo.passcodeHash)) {
         return this.jsonError("Passcode hash mismatch", "INVALID_PASSCODE", 401);
       }
     }
 
     // Store or update device info
     const passcodeHash = body.passcodeHash || this.deviceInfo?.passcodeHash;
-    
+    // A legacy device upgrades by sending a secret once (after proving the passcode above)
+    const deviceSecretHash = this.deviceInfo?.deviceSecretHash || providedSecretHash;
+
     this.deviceInfo = {
       deviceId: normalizedDeviceId,
       deviceName: body.deviceName || this.deviceInfo?.deviceName,
@@ -207,6 +311,7 @@ export class MCPRelay implements DurableObject {
       lastActivity: Date.now(),
       version: body.version,
       passcodeHash,
+      deviceSecretHash,
       registeredAt: this.deviceInfo?.registeredAt || Date.now(),
     };
     this.lastPollTime = Date.now();
@@ -222,11 +327,51 @@ export class MCPRelay implements DurableObject {
       tokenEndpoint: `${this.baseUrl}/oauth/token`,
     };
     
+    response.deviceSecretRegistered = !!deviceSecretHash;
     if (!isReconnection) {
       response.message = "Device registered successfully. Use the passcode you generated to authenticate MCP clients.";
     }
 
     return this.jsonResponse(response);
+  }
+
+  /**
+   * Authenticate a device-only request (/poll, /response, /pong, /status)
+   *
+   * The device proves itself with `Authorization: Device <secret>`, where the
+   * secret is a random value it generated and sent once at registration.
+   * Devices registered before secrets existed are let through unless
+   * REQUIRE_DEVICE_SECRET is set (or `alwaysRequire` is true), until they
+   * upgrade by re-registering with a secret.
+   *
+   * @returns an error response, or null if the request may proceed
+   */
+  private async authenticateDevice(request: Request, alwaysRequire = false): Promise<Response | null> {
+    if (!this.deviceInfo) {
+      // Nothing to protect yet; handlers answer with NOT_REGISTERED
+      return null;
+    }
+
+    const auth = request.headers.get("Authorization") || "";
+    const match = auth.match(/^Device\s+(\S+)$/i);
+
+    if (!this.deviceInfo.deviceSecretHash) {
+      if (this.requireDeviceSecret || alwaysRequire) {
+        return this.jsonError(
+          "This device has no device secret. Update the KOReader MCP plugin and reconnect.",
+          "DEVICE_SECRET_REQUIRED", 401);
+      }
+      return null;
+    }
+
+    if (!match) {
+      return this.jsonError("Device authentication required", "DEVICE_AUTH_REQUIRED", 401);
+    }
+    const providedHash = await hashPasscode(match[1]);
+    if (!timingSafeEqual(providedHash, this.deviceInfo.deviceSecretHash)) {
+      return this.jsonError("Invalid device secret", "INVALID_DEVICE_SECRET", 401);
+    }
+    return null;
   }
 
   /**
@@ -250,12 +395,33 @@ export class MCPRelay implements DurableObject {
       return this.jsonResponse({ valid: false, error: "Device has no credentials" }, 401);
     }
 
+    // Brute-force protection: after a few failures, lock out with exponential backoff
+    const attempts = (await this.state.storage.get<PasscodeAttempts>("passcodeAttempts")) || { failures: 0, lockedUntil: 0 };
+    const now = Date.now();
+    if (attempts.lockedUntil > now) {
+      const minutes = Math.ceil((attempts.lockedUntil - now) / 60_000);
+      return this.jsonResponse({
+        valid: false,
+        error: `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`,
+      }, 429);
+    }
+
     // Verify the provided passcode by hashing and comparing
-    const valid = await verifyPasscode(body.passcode, this.deviceInfo.passcodeHash);
+    const valid = typeof body.passcode === "string" &&
+      await verifyPasscode(body.passcode, this.deviceInfo.passcodeHash);
     if (!valid) {
+      attempts.failures += 1;
+      if (attempts.failures >= MAX_FREE_PASSCODE_ATTEMPTS) {
+        const exponent = attempts.failures - MAX_FREE_PASSCODE_ATTEMPTS;
+        attempts.lockedUntil = now + Math.min(PASSCODE_LOCKOUT_BASE_MS * 2 ** exponent, PASSCODE_LOCKOUT_MAX_MS);
+      }
+      await this.state.storage.put("passcodeAttempts", attempts);
       return this.jsonResponse({ valid: false, error: "Invalid passcode" }, 401);
     }
 
+    if (attempts.failures > 0) {
+      await this.state.storage.delete("passcodeAttempts");
+    }
     return this.jsonResponse({ valid: true });
   }
 
@@ -367,7 +533,7 @@ export class MCPRelay implements DurableObject {
       // Return 401 with WWW-Authenticate header per RFC 9728
       return this.unauthorizedResponse(
         "Bearer token required",
-        `${this.baseUrl}/${this.deviceInfo?.deviceId || "unknown"}/.well-known/oauth-protected-resource`
+        `${this.baseUrl}/mcp/.well-known/oauth-protected-resource`
       );
     }
 
@@ -385,8 +551,9 @@ export class MCPRelay implements DurableObject {
     const queuedRequest: QueuedRequest = {
       requestId,
       method: request.method,
-      path: new URL(request.url).pathname,
-      headers: Object.fromEntries(request.headers),
+      path: "/mcp",
+      // Only protocol-relevant headers; never the client's Authorization header
+      headers: pickHeaders(request.headers, FORWARDED_REQUEST_HEADERS),
       body,
       createdAt: Date.now(),
     };
@@ -413,9 +580,17 @@ export class MCPRelay implements DurableObject {
     // Wait for response
     try {
       const response = await responsePromise;
-      return this.corsResponse(new Response(response.body, {
-        status: response.status,
-        headers: { "Content-Type": "application/json" },
+      const status = Number.isInteger(response.status) && response.status >= 200 && response.status <= 599
+        ? response.status
+        : 502;
+      const headers = pickHeaders(response.headers, FORWARDED_RESPONSE_HEADERS);
+      const hasBody = !NULL_BODY_STATUSES.has(status) && status !== 202 && !!response.body;
+      if (hasBody && !headers["content-type"]) {
+        headers["content-type"] = "application/json";
+      }
+      return this.corsResponse(new Response(hasBody ? response.body : null, {
+        status,
+        headers,
       }));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
@@ -498,15 +673,19 @@ export class MCPRelay implements DurableObject {
     return this.jsonError("Not Found", "NOT_FOUND", 404);
   }
 
-  private methodNotAllowed(): Response {
-    return this.jsonError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+  private methodNotAllowed(allow?: string): Response {
+    const response = this.jsonError("Method Not Allowed", "METHOD_NOT_ALLOWED", 405);
+    if (allow) response.headers.set("Allow", allow);
+    return response;
   }
 
   private corsResponse(response: Response): Response {
     const headers = new Headers(response.headers);
     headers.set("Access-Control-Allow-Origin", "*");
     headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    headers.set("Access-Control-Allow-Headers",
+      "Content-Type, Authorization, Accept, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id, Last-Event-ID");
+    headers.set("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id");
     headers.set("Access-Control-Max-Age", "86400");
     return new Response(response.body, {
       status: response.status,

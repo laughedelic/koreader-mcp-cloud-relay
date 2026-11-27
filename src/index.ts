@@ -171,6 +171,7 @@ export default {
         forwardUrl.pathname = `/${deviceId}/register`;
 
         const headers = new Headers(request.headers);
+        headers.delete("X-OAuth-Authenticated");
         headers.set("X-Relay-Base-URL", url.origin);
 
         return stub.fetch(new Request(forwardUrl.toString(), {
@@ -207,6 +208,7 @@ export default {
       forwardUrl.pathname = `/${deviceId}${pathname}`;
 
       const headers = new Headers(request.headers);
+      headers.delete("X-OAuth-Authenticated");
       headers.set("X-Relay-Base-URL", url.origin);
 
       return stub.fetch(new Request(forwardUrl.toString(), {
