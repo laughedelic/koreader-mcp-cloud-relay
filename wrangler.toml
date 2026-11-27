@@ -33,7 +33,9 @@ local_protocol = "http"
 # pattern = "mcp.koreader.dev/*"
 # custom_domain = true
 
-# [observability]
-# [observability.logs]
-# enabled = true
-# invocation_logs = true
+# Workers Logs: the relay logs one JSON line per device registration.
+# Per-request invocation logs are off, since devices long-poll constantly.
+[observability]
+[observability.logs]
+enabled = true
+invocation_logs = false
