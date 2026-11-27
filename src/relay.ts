@@ -282,6 +282,13 @@ export class MCPRelay implements DurableObject {
       return this.jsonError("passcodeHash is required for first registration", "MISSING_PASSCODE_HASH", 400);
     }
 
+    // With enforcement on, a device that has no secret could register but never
+    // poll, so refuse it here instead of reporting success
+    if (this.requireDeviceSecret && !providedSecretHash && !this.deviceInfo?.deviceSecretHash) {
+      return this.jsonError(
+        "This relay requires a device secret; update the KOReader plugin", "DEVICE_SECRET_REQUIRED", 401);
+    }
+
     if (isReconnection && this.deviceInfo) {
       if (this.deviceInfo.deviceSecretHash) {
         // Device has a secret: re-registration must prove it

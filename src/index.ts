@@ -167,7 +167,12 @@ function protectedResourceMetadataUrl(origin: string): string {
 
 function protectedResourceMetadata(origin: string): Response {
   return new Response(JSON.stringify({
-    resource: `${origin}/mcp`,
+    // The origin, not `${origin}/mcp`: clients put this in the OAuth `resource`
+    // parameter, it becomes the token's audience, and workers-oauth-provider
+    // 0.2.x accepts only an audience equal to the request origin. MCP clients
+    // accept a resource that is a prefix of the server URL. Switch to the /mcp
+    // URL after upgrading to a provider with path-aware audience matching (1.x).
+    resource: origin,
     authorization_servers: [origin],
     scopes_supported: ["mcp:access"],
     bearer_methods_supported: ["header"],

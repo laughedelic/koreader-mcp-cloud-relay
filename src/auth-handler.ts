@@ -502,7 +502,7 @@ app.get("/", (c) => {
 app.get("/mcp/.well-known/oauth-protected-resource", (c) => {
   const origin = new URL(c.req.url).origin;
   return c.json({
-    resource: `${origin}/mcp`,
+    resource: origin, // see protectedResourceMetadata in index.ts
     authorization_servers: [origin],
     scopes_supported: ["mcp:access"],
     bearer_methods_supported: ["header"],
