@@ -268,9 +268,12 @@ export class MCPRelay implements DurableObject {
 
     const isReconnection = !!this.deviceInfo;
 
+    // The secret travels as `Authorization: Device <secret>`, so it must be a
+    // single header-safe token
     if (body.deviceSecret !== undefined &&
-        (typeof body.deviceSecret !== "string" || body.deviceSecret.length < 32 || body.deviceSecret.length > 256)) {
-      return this.jsonError("deviceSecret must be a string of 32-256 characters", "INVALID_DEVICE_SECRET", 400);
+        (typeof body.deviceSecret !== "string" || !/^[A-Za-z0-9._~+\/=-]{32,256}$/.test(body.deviceSecret))) {
+      return this.jsonError(
+        "deviceSecret must be 32-256 characters of A-Z, a-z, 0-9 or ._~+/=-", "INVALID_DEVICE_SECRET", 400);
     }
     const providedSecretHash = body.deviceSecret ? await hashPasscode(body.deviceSecret) : undefined;
 
@@ -287,10 +290,15 @@ export class MCPRelay implements DurableObject {
         }
       } else if (this.deviceInfo.passcodeHash) {
         // Legacy device without a secret: the passcode hash must be present and match
-        // (an absent hash used to be accepted, which let anyone re-register the device)
+        // (an absent hash used to be accepted, which let anyone re-register the device).
+        // A 6-digit passcode's hash is guessable, so this shares the login lockout.
+        const lockout = await this.checkPasscodeLockout();
+        if (lockout) return lockout;
         if (!body.passcodeHash || !timingSafeEqual(body.passcodeHash, this.deviceInfo.passcodeHash)) {
+          await this.recordPasscodeFailure();
           return this.jsonError("Passcode hash mismatch", "INVALID_PASSCODE", 401);
         }
+        await this.clearPasscodeFailures();
       }
       // Passcode can't be changed by re-registration
       if (body.passcodeHash && this.deviceInfo.passcodeHash &&
@@ -303,6 +311,11 @@ export class MCPRelay implements DurableObject {
     const passcodeHash = body.passcodeHash || this.deviceInfo?.passcodeHash;
     // A legacy device upgrades by sending a secret once (after proving the passcode above)
     const deviceSecretHash = this.deviceInfo?.deviceSecretHash || providedSecretHash;
+    if (deviceSecretHash && !this.deviceInfo?.deviceSecretHash) {
+      // Long polls opened before the secret existed were admitted without one:
+      // release them (as a normal empty poll) so no request reaches them
+      this.releasePollWaiters();
+    }
 
     this.deviceInfo = {
       deviceId: normalizedDeviceId,
@@ -396,33 +409,63 @@ export class MCPRelay implements DurableObject {
     }
 
     // Brute-force protection: after a few failures, lock out with exponential backoff
-    const attempts = (await this.state.storage.get<PasscodeAttempts>("passcodeAttempts")) || { failures: 0, lockedUntil: 0 };
-    const now = Date.now();
-    if (attempts.lockedUntil > now) {
-      const minutes = Math.ceil((attempts.lockedUntil - now) / 60_000);
-      return this.jsonResponse({
-        valid: false,
-        error: `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`,
-      }, 429);
+    const lockout = await this.checkPasscodeLockout();
+    if (lockout) {
+      const body = await lockout.json() as { error: string };
+      return this.jsonResponse({ valid: false, error: body.error }, 429);
     }
 
     // Verify the provided passcode by hashing and comparing
     const valid = typeof body.passcode === "string" &&
       await verifyPasscode(body.passcode, this.deviceInfo.passcodeHash);
     if (!valid) {
-      attempts.failures += 1;
-      if (attempts.failures >= MAX_FREE_PASSCODE_ATTEMPTS) {
-        const exponent = attempts.failures - MAX_FREE_PASSCODE_ATTEMPTS;
-        attempts.lockedUntil = now + Math.min(PASSCODE_LOCKOUT_BASE_MS * 2 ** exponent, PASSCODE_LOCKOUT_MAX_MS);
-      }
-      await this.state.storage.put("passcodeAttempts", attempts);
+      await this.recordPasscodeFailure();
       return this.jsonResponse({ valid: false, error: "Invalid passcode" }, 401);
     }
 
-    if (attempts.failures > 0) {
-      await this.state.storage.delete("passcodeAttempts");
-    }
+    await this.clearPasscodeFailures();
     return this.jsonResponse({ valid: true });
+  }
+
+  // ============================================
+  // Passcode lockout (shared by OAuth login and legacy re-registration)
+  // ============================================
+
+  /** @returns a 429 response while locked out, or null */
+  private async checkPasscodeLockout(): Promise<Response | null> {
+    const attempts = await this.state.storage.get<PasscodeAttempts>("passcodeAttempts");
+    const now = Date.now();
+    if (attempts && attempts.lockedUntil > now) {
+      const minutes = Math.ceil((attempts.lockedUntil - now) / 60_000);
+      return this.jsonError(
+        `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`,
+        "TOO_MANY_ATTEMPTS", 429);
+    }
+    return null;
+  }
+
+  private async recordPasscodeFailure(): Promise<void> {
+    const attempts = (await this.state.storage.get<PasscodeAttempts>("passcodeAttempts")) || { failures: 0, lockedUntil: 0 };
+    attempts.failures += 1;
+    if (attempts.failures >= MAX_FREE_PASSCODE_ATTEMPTS) {
+      const exponent = attempts.failures - MAX_FREE_PASSCODE_ATTEMPTS;
+      attempts.lockedUntil = Date.now() + Math.min(PASSCODE_LOCKOUT_BASE_MS * 2 ** exponent, PASSCODE_LOCKOUT_MAX_MS);
+    }
+    await this.state.storage.put("passcodeAttempts", attempts);
+  }
+
+  private async clearPasscodeFailures(): Promise<void> {
+    await this.state.storage.delete("passcodeAttempts");
+  }
+
+  /** End all pending long polls with no request (the device polls again) */
+  private releasePollWaiters(): void {
+    const waiters = this.pollWaiters;
+    this.pollWaiters = [];
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timeout);
+      waiter.resolve(null);
+    }
   }
 
   /**
@@ -533,7 +576,7 @@ export class MCPRelay implements DurableObject {
       // Return 401 with WWW-Authenticate header per RFC 9728
       return this.unauthorizedResponse(
         "Bearer token required",
-        `${this.baseUrl}/mcp/.well-known/oauth-protected-resource`
+        `${this.baseUrl}/.well-known/oauth-protected-resource/mcp`
       );
     }
 
