@@ -157,17 +157,19 @@ Returns relay info and available endpoints.
 | `/poll`     | GET    | Long-poll for incoming MCP requests  |
 | `/response` | POST   | Send response to a forwarded request |
 | `/pong`     | POST   | Keep-alive heartbeat (optional)      |
+| `/status`   | GET    | Check if the device is online        |
 
 All device endpoints require the `X-Device-Id` header (except `/register`, which includes `deviceId` in the JSON body).
 
-`/poll`, `/response`, `/pong` and `/status` also require `Authorization: Device <deviceSecret>`, using the secret the device sent at registration. Re-registering a device that has a secret requires the same secret. Devices registered before device secrets existed can still poll without one, and upgrade by re-registering with a secret and their passcode hash; set `REQUIRE_DEVICE_SECRET = "true"` in `wrangler.toml` to stop accepting them.
+`/poll`, `/response`, `/pong` and `/status` also require `Authorization: Device <deviceSecret>`, using the secret the device sent at registration. Re-registering a device that has a secret requires the same secret. `/status` always requires the secret.
+
+While `REQUIRE_DEVICE_SECRET` is `"false"` (the default, for compatibility), any registration without `deviceSecret` is accepted, new or old, and that device's `/poll`, `/response` and `/pong` calls are not authenticated. Such a device upgrades by re-registering with a secret and its passcode hash. Set `REQUIRE_DEVICE_SECRET = "true"` in `wrangler.toml` to reject secretless registrations and unauthenticated device calls.
 
 ### Client Endpoints (used by Claude/MCP clients)
 
 | Endpoint  | Method | Description                                                                    |
 | --------- | ------ | ------------------------------------------------------------------------------ |
 | `/mcp`    | POST   | Send MCP request (requires Bearer token)                                       |
-| `/status` | GET    | Check if device is online (device endpoint: requires `X-Device-Id` and the device secret) |
 
 Only protocol headers (`Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Mcp-Session-Id`, `Last-Event-ID`, `User-Agent`) are forwarded to the device. The client's `Authorization` header and cookies never leave the relay.
 

@@ -52,8 +52,8 @@ function generateRequestId(): string {
 /**
  * Constant-time string comparison (for hashes of equal, known length)
  */
-function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
+function timingSafeEqual(a: unknown, b: unknown): boolean {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
@@ -276,6 +276,10 @@ export class MCPRelay implements DurableObject {
         "deviceSecret must be 32-256 characters of A-Z, a-z, 0-9 or ._~+/=-", "INVALID_DEVICE_SECRET", 400);
     }
     const providedSecretHash = body.deviceSecret ? await hashPasscode(body.deviceSecret) : undefined;
+
+    if (body.passcodeHash !== undefined && typeof body.passcodeHash !== "string") {
+      return this.jsonError("passcodeHash must be a string", "INVALID_PASSCODE_HASH", 400);
+    }
 
     // On first registration, passcodeHash is required
     if (!isReconnection && !body.passcodeHash) {
