@@ -420,7 +420,12 @@ function dispatch(method: string, params: Record<string, unknown>): RpcResult {
       return { result: { resourceTemplates: data.resourceTemplates } };
     case "resources/read": {
       const uri = String(params.uri || "");
-      const contents = readResource(uri);
+      let contents: ReturnType<typeof readResource> = null;
+      try {
+        contents = readResource(uri);
+      } catch {
+        // malformed percent escapes: treat as not found
+      }
       return contents
         ? { result: { contents: [contents] } }
         : { error: { code: -32002, message: `Resource not found: ${uri}` } };
