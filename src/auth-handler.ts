@@ -320,7 +320,8 @@ async function authenticateDeviceRequest(
     body: JSON.stringify(options),
   }));
   if (!res.ok) {
-    return { error: new Response(res.body, { status: res.status, headers: { "Content-Type": "application/json" } }) };
+    // Buffered, so the device gets a Content-Length response rather than a stream
+    return { error: new Response(await res.text(), { status: res.status, headers: { "Content-Type": "application/json" } }) };
   }
   return { deviceId };
 }
