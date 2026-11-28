@@ -25,6 +25,8 @@ const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"];
 const META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
 const PAGE_CHARS = 1800;
 const MAX_ANNOTATIONS = 50;
+const MAX_NOTE_CHARS = 4000;
+const MAX_SESSIONS = 200;
 
 const INSTRUCTIONS = "Access to the book the user is reading in KOReader on their e-reader. "
   + "Start with get_reading_context to see the current book, page and selection. "
@@ -38,6 +40,8 @@ interface Page {
 
 interface Annotation {
   page: number;
+  start: number;
+  end: number;
   text: string;
   note?: string;
   note_format?: string;
@@ -65,9 +69,29 @@ function paginate(): { pages: Page[]; chapterStarts: number[] } {
 
 const { pages: PAGES, chapterStarts: CHAPTER_STARTS } = paginate();
 
-// Per-isolate demo state
-let currentPage = 1;
-const annotations: Annotation[] = [];
+// Demo state is kept per sign-in (OAuth grant), in this isolate's memory
+// only, so one reviewer never sees another's page or notes
+interface DemoState {
+  currentPage: number;
+  annotations: Annotation[];
+}
+
+const sessions = new Map<string, DemoState>();
+
+function sessionState(key: string): DemoState {
+  let found = sessions.get(key);
+  if (found) {
+    sessions.delete(key); // re-insert to keep the most recent last
+  } else {
+    found = { currentPage: 1, annotations: [] };
+    if (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value!);
+  }
+  sessions.set(key, found);
+  return found;
+}
+
+// The state of the request being handled; set right before the synchronous dispatch
+let state: DemoState = { currentPage: 1, annotations: [] };
 
 function chapterInfo(page: number) {
   const ci = PAGES[page - 1].chapter;
@@ -82,8 +106,8 @@ function metadata() {
     authors: data.book.authors,
     language: data.book.language,
     total_pages: PAGES.length,
-    current_page: currentPage,
-    progress: Math.round((currentPage / PAGES.length) * 100) / 100,
+    current_page: state.currentPage,
+    progress: Math.round((state.currentPage / PAGES.length) * 100) / 100,
     source: data.book.source,
     format: "EPUB",
     demo: true,
@@ -95,11 +119,19 @@ function toc() {
 }
 
 function pageText(n: number): string {
-  let text = PAGES[n - 1].text;
-  for (const a of annotations) {
-    if (a.page === n && text.includes(a.text)) {
-      text = text.replace(a.text, `[HIGHLIGHT]${a.text}[/HIGHLIGHT]${a.note ? ` [NOTE: ${a.note}]` : ""}`);
-    }
+  const source = PAGES[n - 1].text;
+  // Mark highlights by their offsets, last first so earlier offsets stay
+  // valid; overlapping highlights after the first are left unmarked
+  const marks = state.annotations
+    .filter(a => a.page === n)
+    .sort((a, b) => b.start - a.start);
+  let text = source;
+  let limit = source.length;
+  for (const a of marks) {
+    if (a.end > limit) continue;
+    const marked = `[HIGHLIGHT]${source.slice(a.start, a.end)}[/HIGHLIGHT]${a.note ? ` [NOTE: ${a.note}]` : ""}`;
+    text = text.slice(0, a.start) + marked + text.slice(a.end);
+    limit = a.start;
   }
   return text;
 }
@@ -122,23 +154,23 @@ function pagesText(from: number, to: number): string {
 function readingContext(before = 0, after = 0) {
   const context: Record<string, unknown> = {
     book: { title: data.book.title, authors: data.book.authors, total_pages: PAGES.length },
-    chapter: chapterInfo(currentPage),
-    current_page: { number: currentPage, text: pageText(currentPage) },
+    chapter: chapterInfo(state.currentPage),
+    current_page: { number: state.currentPage, text: pageText(state.currentPage) },
   };
   const b = Math.max(0, Math.min(5, Math.floor(before)));
   const a = Math.max(0, Math.min(5, Math.floor(after)));
   if (b || a) {
-    const from = Math.max(1, currentPage - b);
-    const to = Math.min(PAGES.length, currentPage + a);
+    const from = Math.max(1, state.currentPage - b);
+    const to = Math.min(PAGES.length, state.currentPage + a);
     const extra: string[] = [];
-    for (let n = from; n <= to; n++) if (n !== currentPage) extra.push(`== Page ${n} ==\n\n${pageText(n)}`);
+    for (let n = from; n <= to; n++) if (n !== state.currentPage) extra.push(`== Page ${n} ==\n\n${pageText(n)}`);
     context.extra_pages = extra.join("\n\n");
   }
   return context;
 }
 
 function bookmarks() {
-  return annotations.map((a, i) => ({
+  return state.annotations.map((a, i) => ({
     index: i + 1,
     page: a.page,
     text: a.text,
@@ -161,7 +193,9 @@ function parsePosition(pos: unknown): { page: number; offset: number } | null {
   if (!m) return null;
   const page = Number(m[1]);
   if (page < 1 || page > PAGES.length) return null;
-  return { page, offset: Number(m[2]) };
+  const offset = Number(m[2]);
+  if (offset > PAGES[page - 1].text.length) return null;
+  return { page, offset };
 }
 
 function text(t: string) {
@@ -182,7 +216,7 @@ function callTool(name: string, args: Record<string, unknown>) {
       return text(json(readingContext(Number(args.extra_pages_before) || 0, Number(args.extra_pages_after) || 0)));
 
     case "get_book_metadata":
-      return text(json({ ...metadata(), chapter: chapterInfo(currentPage), table_of_contents: toc() }));
+      return text(json({ ...metadata(), chapter: chapterInfo(state.currentPage), table_of_contents: toc() }));
 
     case "read_pages": {
       if (args.chapter !== undefined) {
@@ -193,7 +227,7 @@ function callTool(name: string, args: Record<string, unknown>) {
         const info = chapterInfo(CHAPTER_STARTS[ci - 1]);
         return text(`# ${info.name}\n\n` + pagesText(info.start_page, info.end_page));
       }
-      const range = parseRange(String(args.pages ?? currentPage));
+      const range = parseRange(String(args.pages ?? state.currentPage));
       if (!range) return errorResult(`Error: pages must be like "5" or "3-7", within 1-${PAGES.length}`);
       return text(pagesText(range[0], range[1]));
     }
@@ -229,47 +263,61 @@ function callTool(name: string, args: Record<string, unknown>) {
       if (!Number.isInteger(page) || page < 1 || page > PAGES.length) {
         return errorResult(`Error: page must be 1 to ${PAGES.length}`);
       }
-      currentPage = page;
+      state.currentPage = page;
       return text(`Navigated to page ${page} of ${PAGES.length}`);
     }
 
     case "annotate": {
-      let page = currentPage;
-      let passage = "";
+      let page = state.currentPage;
+      let from = 0;
+      let to = 0;
       const start = parsePosition(args.start);
       const end = parsePosition(args.end);
       if (start && end && start.page === end.page && end.offset > start.offset) {
         page = start.page;
-        passage = PAGES[page - 1].text.slice(start.offset, end.offset);
+        from = start.offset;
+        to = end.offset;
       } else if (typeof args.text === "string" && args.text.trim()) {
         const wanted = args.text.trim();
-        const found = PAGES.find(p => p.text.includes(wanted))
-          || PAGES.find(p => p.text.toLowerCase().includes(wanted.toLowerCase()));
+        let found = PAGES.find(p => p.text.includes(wanted));
+        let at = found ? found.text.indexOf(wanted) : -1;
+        if (!found) {
+          found = PAGES.find(p => p.text.toLowerCase().includes(wanted.toLowerCase()));
+          at = found ? found.text.toLowerCase().indexOf(wanted.toLowerCase()) : -1;
+        }
         if (!found) return errorResult("Error: Text not found in the book");
         page = found.number;
-        const at = found.text.toLowerCase().indexOf(wanted.toLowerCase());
-        passage = found.text.slice(at, at + wanted.length);
+        from = at;
+        to = at + wanted.length;
       } else if (args.start !== undefined || args.end !== undefined) {
         return errorResult("Error: Invalid start/end positions (use positions from search_book)");
       } else {
         return errorResult("Error: No text selected. Pass text, or start/end positions from search_book.");
       }
 
+      const passage = PAGES[page - 1].text.slice(from, to);
       const note = typeof args.note === "string" && args.note ? args.note : undefined;
-      const existing = annotations.find(a => a.page === page && a.text === passage);
+      const tooLong = `Error: Notes in the demo reader are limited to ${MAX_NOTE_CHARS} characters`;
+      if (note && note.length > MAX_NOTE_CHARS) return errorResult(tooLong);
+      const existing = state.annotations.find(a => a.page === page && a.start === from && a.end === to);
       if (existing) {
         if (note && existing.note && existing.note !== note) {
           const mode = args.if_note_exists === "append" ? "append" : args.if_note_exists === "keep" ? "keep" : "replace";
-          if (mode === "append") existing.note = existing.note + "\n\n" + note;
-          else if (mode === "replace") existing.note = note;
+          if (mode === "append") {
+            const appended = existing.note + "\n\n" + note;
+            if (appended.length > MAX_NOTE_CHARS) return errorResult(tooLong);
+            existing.note = appended;
+          } else if (mode === "replace") existing.note = note;
         } else if (note) {
           existing.note = note;
         }
         return text(`Updated the highlight on page ${page}${existing.note ? " with a note" : ""} (demo reader: not saved).`);
       }
-      if (annotations.length >= MAX_ANNOTATIONS) annotations.shift();
-      annotations.push({
+      if (state.annotations.length >= MAX_ANNOTATIONS) state.annotations.shift();
+      state.annotations.push({
         page,
+        start: from,
+        end: to,
         text: passage,
         note,
         note_format: typeof args.note_format === "string" ? args.note_format : undefined,
@@ -397,7 +445,7 @@ function rpcResponse(body: unknown, status = 200): Response {
 }
 
 /** Handle an authenticated MCP request for the demo reader */
-export async function handleDemoMcp(request: Request): Promise<Response> {
+export async function handleDemoMcp(request: Request, session: string): Promise<Response> {
   if (request.method !== "POST") {
     return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
       status: 405,
@@ -434,6 +482,8 @@ export async function handleDemoMcp(request: Request): Promise<Response> {
     }, 400);
   }
 
+  // dispatch is synchronous, so no other request can swap the state midway
+  state = sessionState(session);
   const { result, error } = dispatch(message.method, params);
   return rpcResponse(error
     ? { jsonrpc: "2.0", id: message.id, error }

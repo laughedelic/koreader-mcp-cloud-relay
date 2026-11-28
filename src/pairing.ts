@@ -78,7 +78,8 @@ export class PairingIndex implements DurableObject {
           return this.mint(String(body.deviceId || ""));
         case "redeem":
           return this.redeem(String(body.code || ""), String(body.ip || "unknown"),
-            typeof body.deviceId === "string" && body.deviceId ? body.deviceId : undefined);
+            typeof body.deviceId === "string" && body.deviceId ? body.deviceId : undefined,
+            body.demo === true);
         case "revoke-device":
           await this.dropDeviceCode(String(body.deviceId || ""));
           return json({ ok: true });
@@ -124,9 +125,11 @@ export class PairingIndex implements DurableObject {
   /**
    * Exchange a code for its device ID, once. With `expectedDeviceId` (sign-in
    * started from a device-specific URL) a code for another device counts as
-   * a wrong guess and stays valid for its own device.
+   * a wrong guess and stays valid for its own device. With `demo` the caller
+   * has matched the demo reader's code, which is accepted only within the
+   * same guess limits.
    */
-  private async redeem(code: string, ip: string, expectedDeviceId?: string): Promise<Response> {
+  private async redeem(code: string, ip: string, expectedDeviceId?: string, demo = false): Promise<Response> {
     const now = Date.now();
     const ipKey = `fail-ip:${ip}`;
     const globalKey = "fail-global";
@@ -143,6 +146,9 @@ export class PairingIndex implements DurableObject {
         code: "TOO_MANY_ATTEMPTS",
       }, 429);
     }
+
+    // The caller already matched the demo code; it only needed the limit check
+    if (demo) return json({ demo: true });
 
     const normalized = code.replace(/\D/g, "");
     let entry: PairingEntry | undefined;

@@ -149,7 +149,7 @@ Set a secret pairing code of 8 to 16 digits to enable a built-in demo reader:
 bun run wrangler secret put DEMO_PAIRING_CODE
 ```
 
-Signing in with that code connects the AI app to `demo-reader`, which the Worker answers itself with the plugin's tools, resources and prompts over a public-domain sample book (*Alice's Adventures in Wonderland*, chapters I to III). It exists so connector directory reviewers can try every tool without an e-reader. Page turns and highlights live only in the Worker's memory. It speaks MCP 2025-03-26 to 2025-11-25. The tool definitions come from the plugin (`src/demo-data.json`); regenerate them when the plugin's tools change.
+Signing in with that code connects the AI app to `demo-reader`, which the Worker answers itself with the plugin's tools, resources and prompts over a public-domain sample book (*Alice's Adventures in Wonderland*, chapters I to III). It exists so connector directory reviewers can try every tool without an e-reader. Page turns and highlights live only in the Worker's memory, separately for each sign-in. The demo code counts against the same wrong-guess limits as pairing codes, and removing the secret turns the demo off, including for apps already signed in. It speaks MCP 2025-03-26 to 2025-11-25. The tool definitions come from the plugin (`src/demo-data.json`); regenerate them when the plugin's tools change.
 
 ## API Endpoints
 

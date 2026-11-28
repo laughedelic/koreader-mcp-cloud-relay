@@ -237,10 +237,14 @@ app.post("/authorize", async (c) => {
   }), status);
 
   let deviceId: string;
+  let demo = false;
   try {
-    if (pairingCode && isDemoCode(pairingCode, c.env.DEMO_PAIRING_CODE)) {
-      deviceId = DEMO_DEVICE_ID;
-    } else if (pairingCode) {
+    if (pairingCode) {
+      // The demo code goes through the same guess limits as pairing codes
+      demo = isDemoCode(pairingCode, c.env.DEMO_PAIRING_CODE);
+      if (demo && lockedDeviceId && lockedDeviceId !== DEMO_DEVICE_ID) {
+        return fail("That code belongs to a different reader.");
+      }
       const stub = c.env.PAIRING_INDEX.get(c.env.PAIRING_INDEX.idFromName("global"));
       const res = await stub.fetch(new Request("http://internal/redeem", {
         method: "POST",
@@ -249,13 +253,14 @@ app.post("/authorize", async (c) => {
           code: pairingCode,
           ip: c.req.header("CF-Connecting-IP") || "unknown",
           deviceId: lockedDeviceId,
+          demo,
         }),
       }));
-      const body = await res.json() as { deviceId?: string; error?: string };
-      if (!res.ok || !body.deviceId) {
+      const body = await res.json() as { deviceId?: string; demo?: boolean; error?: string };
+      if (!res.ok || !(body.deviceId || (demo && body.demo))) {
         return fail(body.error || "That code didn't work. Get a new one on your reader.", res.status === 429 ? 429 : 401);
       }
-      deviceId = body.deviceId;
+      deviceId = demo ? DEMO_DEVICE_ID : body.deviceId!;
     } else {
       deviceId = lockedDeviceId || deviceIdInput;
       if (!deviceId || !passcode) {
@@ -295,12 +300,13 @@ app.post("/authorize", async (c) => {
         label: `KOReader: ${deviceId}`,
         deviceId,
         clientName,
-        method: pairingCode ? "pairing-code" : "passcode",
+        method: demo ? "demo" : pairingCode ? "pairing-code" : "passcode",
       },
       scope: oauthReqInfo.scope,
-      props: { deviceId },
+      // demoSession marks demo grants and keeps each one's demo state apart
+      props: demo ? { deviceId, demoSession: crypto.randomUUID() } : { deviceId },
     });
-    console.log(JSON.stringify({ event: "authorize", deviceId, method: pairingCode ? "pairing-code" : "passcode", clientName }));
+    console.log(JSON.stringify({ event: "authorize", deviceId, method: demo ? "demo" : pairingCode ? "pairing-code" : "passcode", clientName }));
     return c.redirect(redirectTo, 302);
   } catch (error) {
     console.error("completeAuthorization error:", error);
@@ -319,7 +325,7 @@ async function authenticateDeviceRequest(
   options: { enablePairingCodes?: boolean } = {},
 ): Promise<{ deviceId: string } | { error: Response }> {
   const deviceId = (c.req.header("X-Device-Id") || "").trim().toLowerCase();
-  if (!DEVICE_ID_PATTERN.test(deviceId)) {
+  if (!DEVICE_ID_PATTERN.test(deviceId) || deviceId.toLowerCase() === DEMO_DEVICE_ID) {
     return { error: Response.json({ error: "X-Device-Id is required", code: "MISSING_DEVICE_ID" }, { status: 400 }) };
   }
   const stub = c.env.MCP_RELAY.get(c.env.MCP_RELAY.idFromName(deviceId));
@@ -565,8 +571,9 @@ app.all("/:deviceId/*", async (c) => {
     }, 404);
   }
 
-  // Internal-only endpoints are never reachable from outside
-  if (action === "verify-passcode" || action === "device-auth") {
+  // Internal-only endpoints are never reachable from outside, and the demo
+  // reader has no device endpoints (nobody may register or poll as it)
+  if (action === "verify-passcode" || action === "device-auth" || deviceId.toLowerCase() === DEMO_DEVICE_ID) {
     return c.json({ error: { code: "NOT_FOUND", message: "Not Found" } }, 404);
   }
 
