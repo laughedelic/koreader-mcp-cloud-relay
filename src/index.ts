@@ -12,6 +12,13 @@ import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { AuthHandler } from "./auth-handler";
 import type { Env } from "./types";
 import { DEMO_DEVICE_ID, handleDemoMcp } from "./demo";
+import { generateAppKey, openSnapshot, parseAppKey, publicJwk, type AppKey } from "./memory-crypto";
+import { OFFLINE_FRAME_HEADER, decodeOfflineFrame } from "./offline-frame";
+import { handleOfflineMcp, parseSnapshot, type OfflineContext } from "./offline";
+
+// No snapshot can be larger than this, whatever SNAPSHOT_MAX_BYTES says:
+// a Durable Object stores at most 2 MB in one value
+const SNAPSHOT_HARD_LIMIT = 1024 * 1024;
 
 // Re-export the Durable Object class
 export { MCPRelay } from "./relay";
@@ -31,7 +38,9 @@ const mcpApiHandler = {
     const path = url.pathname;
     const pathParts = path.split("/").filter(Boolean);
     const headerDeviceId = request.headers.get("X-Device-Id") || undefined;
-    const contextProps = (ctx as unknown as { props?: { deviceId?: string; demoSession?: string } })?.props;
+    const contextProps = (ctx as unknown as {
+      props?: { deviceId?: string; demoSession?: string; memoryKey?: unknown };
+    })?.props;
     const contextDeviceId = contextProps?.deviceId;
 
     let deviceId: string | undefined;
@@ -110,16 +119,66 @@ const mcpApiHandler = {
     headers.set("X-Relay-Base-URL", url.origin);
     headers.set("X-OAuth-Authenticated", "true");
 
+    // Offline memory: tell the device's object which app is calling and what
+    // its public key is, so snapshots get encrypted for it. The private key
+    // stays here, in the decrypted grant props.
+    const appKey = parseAppKey(contextProps?.memoryKey);
+    headers.delete("X-Memory-Key-Id");
+    headers.delete("X-Memory-Public-Key");
+    if (appKey) {
+      headers.set("X-Memory-Key-Id", appKey.id);
+      headers.set("X-Memory-Public-Key", JSON.stringify(publicJwk(appKey.jwk)));
+    }
+
     const forwardUrl = new URL(request.url);
     forwardUrl.pathname = `/${deviceId}/mcp`;
 
-    return stub.fetch(new Request(forwardUrl.toString(), {
+    // The body is read here, since an offline reader's request is answered
+    // by the Worker after the object has looked at it
+    const bodyText = request.method === "POST" ? await request.text() : undefined;
+    const response = await stub.fetch(new Request(forwardUrl.toString(), {
       method: request.method,
       headers,
-      body: request.body,
+      body: bodyText,
     }));
+    if (response.headers.get(OFFLINE_FRAME_HEADER) !== "1" || bodyText === undefined) {
+      return response;
+    }
+    return answerOffline(bodyText, request.headers, await response.arrayBuffer(), appKey);
   },
 };
+
+/**
+ * Answer an MCP request for a reader that is offline: from its saved copy if
+ * this app can open one, or with a plain "reader offline" result.
+ */
+async function answerOffline(
+  bodyText: string, headers: Headers, frame: ArrayBuffer, appKey: AppKey | null,
+): Promise<Response> {
+  let context: OfflineContext;
+  try {
+    const { info, ciphertext } = decodeOfflineFrame(frame);
+    context = { info, memory: info.memory === "locked" ? "locked" : "none", snapshot: null, now: Date.now() };
+    if (info.memory === "sealed" && info.snapshot && appKey) {
+      context.memory = "unreadable";
+      try {
+        const plaintext = await openSnapshot({ ...info.snapshot, ct: ciphertext }, appKey);
+        context.snapshot = parseSnapshot(new TextDecoder().decode(plaintext));
+        if (context.snapshot) context.memory = "ok";
+      } catch (error) {
+        console.error("Offline memory: could not open a snapshot:", error instanceof Error ? error.message : error);
+      }
+    }
+  } catch (error) {
+    console.error("Offline answer failed:", error instanceof Error ? error.message : error);
+    return new Response(JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Device is offline" },
+      id: null,
+    }), { status: 503, headers: { "Content-Type": "application/json" } });
+  }
+  return handleOfflineMcp(bodyText, headers, context);
+}
 
 /**
  * Export the OAuthProvider as the default export
@@ -145,6 +204,17 @@ const oauthProvider = new OAuthProvider({
   // Default handler for all other routes (auth UI, home page, device endpoints)
   // @ts-expect-error - Type mismatch between Hono and OAuthProvider
   defaultHandler: AuthHandler,
+
+  // Offline memory: apps paired before it existed get their key pair the
+  // next time they refresh their token (new pairings get one right away,
+  // see auth-handler.ts). The device's object learns the public key from
+  // the app's next request.
+  tokenExchangeCallback: async ({ grantType, props }) => {
+    if (grantType !== "refresh_token" || !props || typeof props !== "object") return;
+    const current = props as { deviceId?: string; demoSession?: string; memoryKey?: unknown };
+    if (!current.deviceId || current.demoSession || parseAppKey(current.memoryKey)) return;
+    return { newProps: { ...current, memoryKey: await generateAppKey() } };
+  },
   onError: (error) => {
     if (error.code === "invalid_token") {
       const headers = {
@@ -237,12 +307,12 @@ export default {
     // CORS preflights for the root device endpoints: answered here, since
     // they carry no device ID to route by and would otherwise reach OAuth
     if (request.method === "OPTIONS" &&
-        ["/register", "/poll", "/pong", "/response", "/status"].includes(pathname)) {
+        ["/register", "/poll", "/pong", "/response", "/status", "/snapshot", "/bye"].includes(pathname)) {
       return new Response(null, {
         status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
           "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Device-Id",
           "Access-Control-Max-Age": "86400",
         },
@@ -294,7 +364,9 @@ export default {
     if ((pathname === "/poll" && request.method === "GET") ||
         (pathname === "/pong" && request.method === "POST") ||
         (pathname === "/response" && request.method === "POST") ||
-        (pathname === "/status" && request.method === "GET")) {
+        (pathname === "/status" && request.method === "GET") ||
+        (pathname === "/bye" && request.method === "POST") ||
+        (pathname === "/snapshot" && ["GET", "PUT", "DELETE"].includes(request.method))) {
       const headerDeviceId = request.headers.get("X-Device-Id") || "";
       const queryDeviceId = url.searchParams.get("device_id") || "";
       const deviceId = (headerDeviceId || queryDeviceId).trim().toLowerCase();
@@ -315,10 +387,37 @@ export default {
       headers.delete("X-OAuth-Authenticated");
       headers.set("X-Relay-Base-URL", url.origin);
 
+      // Snapshot and goodbye requests are read in full before they are
+      // passed on: their object may answer without reading the body (too
+      // large, too often), which a streamed body doesn't survive
+      let body: BodyInit | null = request.body;
+      if (pathname === "/snapshot" || pathname === "/bye") {
+        body = null;
+        if (request.method === "PUT" || request.method === "POST") {
+          const declared = Number(request.headers.get("Content-Length") ?? NaN);
+          if (!Number.isFinite(declared)) {
+            return new Response(JSON.stringify({ error: "Content-Length is required", code: "LENGTH_REQUIRED" }), {
+              status: 411,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (declared > SNAPSHOT_HARD_LIMIT) {
+            return new Response(JSON.stringify({ error: "Snapshot is too large", code: "SNAPSHOT_TOO_LARGE" }), {
+              status: 413,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          body = await request.arrayBuffer();
+        }
+      }
+
       return stub.fetch(new Request(forwardUrl.toString(), {
         method: request.method,
         headers,
-        body: request.body,
+        body,
+        // A long poll the reader closes must end in its object too, so no
+        // request is handed to a connection nobody reads
+        signal: pathname === "/poll" ? request.signal : undefined,
       }));
     }
 
