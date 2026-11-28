@@ -11,6 +11,7 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { AuthHandler } from "./auth-handler";
 import type { Env } from "./types";
+import { DEMO_DEVICE_ID, handleDemoMcp } from "./demo";
 
 // Re-export the Durable Object class
 export { MCPRelay } from "./relay";
@@ -80,6 +81,11 @@ const mcpApiHandler = {
         status: 400,
         headers: { "Content-Type": "application/json" },
       });
+    }
+
+    // The built-in demo reader answers in the Worker itself
+    if (deviceId === DEMO_DEVICE_ID) {
+      return handleDemoMcp(request);
     }
 
     // Get the Durable Object for this device
@@ -239,6 +245,12 @@ export default {
         const deviceId = typeof payload.deviceId === "string" ? payload.deviceId.trim().toLowerCase() : "";
         if (!deviceId) {
           return new Response(JSON.stringify({ error: "deviceId is required" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (deviceId === DEMO_DEVICE_ID) {
+          return new Response(JSON.stringify({ error: "This device ID is reserved", code: "RESERVED_DEVICE_ID" }), {
             status: 400,
             headers: { "Content-Type": "application/json" },
           });

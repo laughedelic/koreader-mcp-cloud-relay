@@ -9,6 +9,7 @@
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { Hono } from "hono";
 import type { Env } from "./types";
+import { DEMO_DEVICE_ID } from "./demo";
 
 interface AuthEnv extends Env {
   OAUTH_PROVIDER: OAuthHelpers;
@@ -136,7 +137,7 @@ function renderLoginPage(opts: LoginPageOptions): string {
         <div class="form-group">
           <label for="pairing_code">Pairing code</label>
           <input type="text" class="code" id="pairing_code" name="pairing_code"
-            inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7"
+            inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,16}" maxlength="16"
             placeholder="000000" ${legacyOpen ? "" : "autofocus"}>
           <p class="hint">6 digits, valid for 10 minutes.</p>
         </div>
@@ -156,6 +157,14 @@ function renderLoginPage(opts: LoginPageOptions): string {
     </div>
   </body>
 </html>`;
+}
+
+/** The demo code: a configured secret of 8+ digits, compared in constant time */
+function isDemoCode(code: string, demo: string | undefined): boolean {
+  if (!demo || !/^\d{8,16}$/.test(demo) || code.length !== demo.length) return false;
+  let diff = 0;
+  for (let i = 0; i < code.length; i++) diff |= code.charCodeAt(i) ^ demo.charCodeAt(i);
+  return diff === 0;
 }
 
 function encodeOAuthState(info: AuthRequest): string {
@@ -229,7 +238,9 @@ app.post("/authorize", async (c) => {
 
   let deviceId: string;
   try {
-    if (pairingCode) {
+    if (pairingCode && isDemoCode(pairingCode, c.env.DEMO_PAIRING_CODE)) {
+      deviceId = DEMO_DEVICE_ID;
+    } else if (pairingCode) {
       const stub = c.env.PAIRING_INDEX.get(c.env.PAIRING_INDEX.idFromName("global"));
       const res = await stub.fetch(new Request("http://internal/redeem", {
         method: "POST",
