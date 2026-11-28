@@ -16,6 +16,10 @@ import { generateAppKey, openSnapshot, parseAppKey, publicJwk, type AppKey } fro
 import { OFFLINE_FRAME_HEADER, decodeOfflineFrame } from "./offline-frame";
 import { handleOfflineMcp, parseSnapshot, type OfflineContext } from "./offline";
 
+// No snapshot can be larger than this, whatever SNAPSHOT_MAX_BYTES says:
+// a Durable Object stores at most 2 MB in one value
+const SNAPSHOT_HARD_LIMIT = 1024 * 1024;
+
 // Re-export the Durable Object class
 export { MCPRelay } from "./relay";
 export { PairingIndex } from "./pairing";
@@ -303,7 +307,7 @@ export default {
     // CORS preflights for the root device endpoints: answered here, since
     // they carry no device ID to route by and would otherwise reach OAuth
     if (request.method === "OPTIONS" &&
-        ["/register", "/poll", "/pong", "/response", "/status", "/snapshot"].includes(pathname)) {
+        ["/register", "/poll", "/pong", "/response", "/status", "/snapshot", "/bye"].includes(pathname)) {
       return new Response(null, {
         status: 204,
         headers: {
@@ -361,6 +365,7 @@ export default {
         (pathname === "/pong" && request.method === "POST") ||
         (pathname === "/response" && request.method === "POST") ||
         (pathname === "/status" && request.method === "GET") ||
+        (pathname === "/bye" && request.method === "POST") ||
         (pathname === "/snapshot" && ["GET", "PUT", "DELETE"].includes(request.method))) {
       const headerDeviceId = request.headers.get("X-Device-Id") || "";
       const queryDeviceId = url.searchParams.get("device_id") || "";
@@ -382,19 +387,34 @@ export default {
       headers.delete("X-OAuth-Authenticated");
       headers.set("X-Relay-Base-URL", url.origin);
 
-      // A snapshot far over the limit is refused before it is read
-      if (pathname === "/snapshot" && request.method === "PUT"
-          && Number(request.headers.get("Content-Length") || 0) > 8 * 1024 * 1024) {
-        return new Response(JSON.stringify({ error: "Snapshot is too large", code: "SNAPSHOT_TOO_LARGE" }), {
-          status: 413,
-          headers: { "Content-Type": "application/json" },
-        });
+      // Snapshot and goodbye requests are read in full before they are
+      // passed on: their object may answer without reading the body (too
+      // large, too often), which a streamed body doesn't survive
+      let body: BodyInit | null = request.body;
+      if (pathname === "/snapshot" || pathname === "/bye") {
+        body = null;
+        if (request.method === "PUT" || request.method === "POST") {
+          const declared = Number(request.headers.get("Content-Length") ?? NaN);
+          if (!Number.isFinite(declared)) {
+            return new Response(JSON.stringify({ error: "Content-Length is required", code: "LENGTH_REQUIRED" }), {
+              status: 411,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (declared > SNAPSHOT_HARD_LIMIT) {
+            return new Response(JSON.stringify({ error: "Snapshot is too large", code: "SNAPSHOT_TOO_LARGE" }), {
+              status: 413,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          body = await request.arrayBuffer();
+        }
       }
 
       return stub.fetch(new Request(forwardUrl.toString(), {
         method: request.method,
         headers,
-        body: request.body,
+        body,
         // A long poll the reader closes must end in its object too, so no
         // request is handed to a connection nobody reads
         signal: pathname === "/poll" ? request.signal : undefined,

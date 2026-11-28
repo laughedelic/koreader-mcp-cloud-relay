@@ -622,8 +622,10 @@ app.all("/:deviceId/*", async (c) => {
   }
 
   // Internal-only endpoints are never reachable from outside, and the demo
-  // reader has no device endpoints (nobody may register or poll as it)
-  if (action === "verify-passcode" || action === "device-auth" || action === "app-key"
+  // reader has no device endpoints (nobody may register or poll as it).
+  // Snapshots and goodbyes exist only as /snapshot and /bye (index.ts),
+  // where their size is checked before they are read.
+  if (["verify-passcode", "device-auth", "app-key", "snapshot", "bye"].includes(action)
       || deviceId.toLowerCase() === DEMO_DEVICE_ID) {
     return c.json({ error: { code: "NOT_FOUND", message: "Not Found" } }, 404);
   }

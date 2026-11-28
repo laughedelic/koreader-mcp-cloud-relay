@@ -163,7 +163,7 @@ A reader counts as reachable while it waits in a long poll, works on a request, 
 - Tool calls return a normal tool result that starts with `[Reader offline]`, says when the reader was last seen and tells the model how the user can bring it back. Tools that change something (`goto_page`, `annotate`) say that nothing was done.
 - Every result carries `structuredContent.reader` (`online: false`, `last_seen`, `source`).
 
-A reader that vanishes with its long poll open (WiFi dropped) can't be told apart from one that is slow, so the first request after that waits the full 30 second request timeout before it gets the offline answer (worded as "did not answer in time"). Later requests are answered at once. Two things shorten that wait when the reader leaves in an orderly way: a reader that sends `X-Reader-Leaving: 1` with its last `PUT /snapshot` is offline from that moment, and `wrangler.toml` sets the `enable_request_signal` compatibility flag so the relay can end a poll whose connection the reader closed. The second one is not reported by local `wrangler dev`, so it has not been tested there.
+A reader that vanishes with its long poll open (WiFi dropped) can't be told apart from one that is slow, so the first request after that waits the full 30 second request timeout before it gets the offline answer (worded as "did not answer in time"). Later requests are answered at once. Two things shorten that wait when the reader leaves in an orderly way: a reader that calls `POST /bye` (or sends `X-Reader-Leaving: 1` with its last `PUT /snapshot`) is offline from that moment, and `wrangler.toml` sets the `enable_request_signal` compatibility flag so the relay can end a poll whose connection the reader closed. The second one is not reported by local `wrangler dev`, so it has not been tested there.
 
 Without offline memory this stores nothing about the book. The relay keeps the time it last heard from the reader and the plugin's tool list.
 
@@ -235,13 +235,14 @@ Returns relay info and available endpoints.
 | `/pairing-code` | POST | Get a one-time pairing code (`{code, expiresAt, expiresIn, relayUrl}`) |
 | `/connected-apps` | GET | List authorized AI apps (`{apps: [{id, name, connectedAt}]}`, `connectedAt` in Unix seconds) |
 | `/connected-apps/{id}` | DELETE | Disconnect an AI app (revokes its grant and tokens) |
+| `/bye` | POST | The reader is about to sleep or stop: requests get the offline answer at once until it polls again |
 | `/snapshot` | PUT | Save a snapshot of what is being read (see [Offline memory](#offline-memory)) |
 | `/snapshot` | GET | What is saved (`{stored, receivedAt, expiresAt, bytes, scope, apps}`), never the content |
 | `/snapshot` | DELETE | Delete the saved snapshot |
 
 All device endpoints require the `X-Device-Id` header (except `/register`, which includes `deviceId` in the JSON body).
 
-`/poll`, `/response`, `/pong`, `/status`, `/pairing-code`, `/connected-apps` and `/snapshot` also require `Authorization: Device <deviceSecret>`, using the secret the device sent at registration. Re-registering a device that has a secret requires the same secret. `/status`, `/pairing-code`, `/connected-apps` and `/snapshot` always require the secret.
+`/poll`, `/response`, `/pong`, `/status`, `/bye`, `/pairing-code`, `/connected-apps` and `/snapshot` also require `Authorization: Device <deviceSecret>`, using the secret the device sent at registration. Re-registering a device that has a secret requires the same secret. `/status`, `/bye`, `/pairing-code`, `/connected-apps` and `/snapshot` always require the secret.
 
 While `REQUIRE_DEVICE_SECRET` is `"false"` (the default, for compatibility), any registration without `deviceSecret` is accepted, new or old, and that device's `/poll`, `/response` and `/pong` calls are not authenticated. Such a device upgrades by re-registering with a secret and its passcode hash. Set `REQUIRE_DEVICE_SECRET = "true"` in `wrangler.toml` to reject secretless registrations and unauthenticated device calls.
 
@@ -314,7 +315,7 @@ Settings in `wrangler.toml` (`[vars]`):
 | Variable | Default | Description |
 | -------- | ------- | ----------- |
 | `REQUIRE_DEVICE_SECRET` | `"false"` | Reject devices that register without a device secret |
-| `SNAPSHOT_MAX_BYTES` | `"262144"` | Largest snapshot the relay accepts (256 KB keeps an offline answer well inside the free plan's 10 ms of CPU time). `"0"` turns offline memory off |
+| `SNAPSHOT_MAX_BYTES` | `"262144"` | Largest snapshot the relay accepts (256 KB keeps an offline answer well inside the free plan's 10 ms of CPU time). `"0"` turns offline memory off, and 1 MB (`"1048576"`) is the most it can be |
 | `SNAPSHOT_MAX_RETENTION_DAYS` | `"30"` | Longest time a snapshot is kept |
 
 ## Testing

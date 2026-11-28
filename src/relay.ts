@@ -230,7 +230,9 @@ export class MCPRelay implements DurableObject {
       SNAPSHOT_MAX_RETENTION_DAYS?: string;
     };
     this.requireDeviceSecret = vars.REQUIRE_DEVICE_SECRET === "true";
-    this.snapshotMaxBytes = nonNegativeInt(vars.SNAPSHOT_MAX_BYTES, DEFAULT_SNAPSHOT_MAX_BYTES);
+    // Never above 1 MB: a stored value can hold at most 2 MB
+    this.snapshotMaxBytes = Math.min(
+      nonNegativeInt(vars.SNAPSHOT_MAX_BYTES, DEFAULT_SNAPSHOT_MAX_BYTES), 1024 * 1024);
     this.snapshotMaxRetentionDays =
       Math.max(1, nonNegativeInt(vars.SNAPSHOT_MAX_RETENTION_DAYS, DEFAULT_SNAPSHOT_MAX_RETENTION_DAYS));
     // Restore device info from storage
@@ -261,8 +263,9 @@ export class MCPRelay implements DurableObject {
     }
 
     // Device-only endpoints require the device secret (see authenticateDevice)
-    if (["poll", "response", "pong", "status", "snapshot"].includes(action)) {
-      const authError = await this.authenticateDevice(request, action === "status" || action === "snapshot");
+    if (["poll", "response", "pong", "status", "snapshot", "bye"].includes(action)) {
+      const authError = await this.authenticateDevice(
+        request, action === "status" || action === "snapshot" || action === "bye");
       if (authError) return authError;
     }
 
@@ -299,6 +302,13 @@ export class MCPRelay implements DurableObject {
         return request.method === "GET"
           ? this.handleStatus()
           : this.methodNotAllowed();
+
+      case "bye":
+        // The reader is about to sleep or stop its server
+        if (request.method !== "POST") return this.methodNotAllowed();
+        if (!this.deviceInfo) return this.jsonError("Not registered", "NOT_REGISTERED", 410);
+        await this.markLeft();
+        return this.jsonResponse({ ok: true });
 
       case "snapshot":
         if (request.method === "PUT") {
