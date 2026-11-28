@@ -26,6 +26,7 @@ const META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
 const PAGE_CHARS = 1800;
 const MAX_ANNOTATIONS = 50;
 const MAX_NOTE_CHARS = 4000;
+const NOTE_FORMATS = ["plain", "markdown", "html"];
 const MAX_SESSIONS = 200;
 
 const INSTRUCTIONS = "Access to the book the user is reading in KOReader on their e-reader. "
@@ -298,6 +299,9 @@ function callTool(name: string, args: Record<string, unknown>) {
       const passage = PAGES[page - 1].text.slice(from, to);
       const note = typeof args.note === "string" && args.note ? args.note : undefined;
       const tooLong = `Error: Notes in the demo reader are limited to ${MAX_NOTE_CHARS} characters`;
+      const format = args.note_format === undefined ? undefined
+        : NOTE_FORMATS.includes(args.note_format as string) ? args.note_format as string : null;
+      if (format === null) return errorResult(`Error: note_format must be one of: ${NOTE_FORMATS.join(", ")}`);
       if (note && note.length > MAX_NOTE_CHARS) return errorResult(tooLong);
       const existing = state.annotations.find(a => a.page === page && a.start === from && a.end === to);
       if (existing) {
@@ -307,9 +311,14 @@ function callTool(name: string, args: Record<string, unknown>) {
             const appended = existing.note + "\n\n" + note;
             if (appended.length > MAX_NOTE_CHARS) return errorResult(tooLong);
             existing.note = appended;
-          } else if (mode === "replace") existing.note = note;
+            existing.note_format = format ?? existing.note_format;
+          } else if (mode === "replace") {
+            existing.note = note;
+            existing.note_format = format;
+          }
         } else if (note) {
           existing.note = note;
+          existing.note_format = format;
         }
         return text(`Updated the highlight on page ${page}${existing.note ? " with a note" : ""} (demo reader: not saved).`);
       }
@@ -320,7 +329,7 @@ function callTool(name: string, args: Record<string, unknown>) {
         end: to,
         text: passage,
         note,
-        note_format: typeof args.note_format === "string" ? args.note_format : undefined,
+        note_format: note ? format : undefined,
         created: new Date().toISOString(),
       });
       return text(`${note ? "Added a note" : "Highlighted"} on page ${page}: "${passage.slice(0, 120)}" (demo reader: not saved).`);

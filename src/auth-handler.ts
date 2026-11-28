@@ -241,10 +241,10 @@ app.post("/authorize", async (c) => {
   try {
     if (pairingCode) {
       // The demo code goes through the same guess limits as pairing codes
-      demo = isDemoCode(pairingCode, c.env.DEMO_PAIRING_CODE);
-      if (demo && lockedDeviceId && lockedDeviceId !== DEMO_DEVICE_ID) {
-        return fail("That code belongs to a different reader.");
-      }
+      // On a sign-in locked to another reader the demo code is just a wrong
+      // guess, counted like any other so it reveals nothing
+      demo = isDemoCode(pairingCode, c.env.DEMO_PAIRING_CODE)
+        && (!lockedDeviceId || lockedDeviceId === DEMO_DEVICE_ID);
       const stub = c.env.PAIRING_INDEX.get(c.env.PAIRING_INDEX.idFromName("global"));
       const res = await stub.fetch(new Request("http://internal/redeem", {
         method: "POST",
