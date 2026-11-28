@@ -690,6 +690,9 @@ export class MCPRelay implements DurableObject {
     const responsePromise = new Promise<ResponseMessage>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(requestId);
+        // Drop it from the queue too, so a reader that reconnects later
+        // doesn't receive a request nobody is waiting for
+        this.requestQueue = this.requestQueue.filter(q => q.requestId !== requestId);
         reject(new Error("Request timeout"));
       }, REQUEST_TIMEOUT);
 

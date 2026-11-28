@@ -69,17 +69,23 @@ export class PairingIndex implements DurableObject {
     } catch {
       return json({ error: "Invalid JSON" }, 400);
     }
-    switch (action) {
-      case "mint":
-        return this.mint(String(body.deviceId || ""));
-      case "redeem":
-        return this.redeem(String(body.code || ""), String(body.ip || "unknown"));
-      case "revoke-device":
-        await this.dropDeviceCode(String(body.deviceId || ""));
-        return json({ ok: true });
-      default:
-        return json({ error: "Not Found" }, 404);
-    }
+    // Hashing is async and not a storage call, so without this other requests
+    // could interleave mid-operation: a burst of guesses could all read the
+    // failure counters before any of them is bumped, or redeem a code twice
+    return this.state.blockConcurrencyWhile(async () => {
+      switch (action) {
+        case "mint":
+          return this.mint(String(body.deviceId || ""));
+        case "redeem":
+          return this.redeem(String(body.code || ""), String(body.ip || "unknown"),
+            typeof body.deviceId === "string" && body.deviceId ? body.deviceId : undefined);
+        case "revoke-device":
+          await this.dropDeviceCode(String(body.deviceId || ""));
+          return json({ ok: true });
+        default:
+          return json({ error: "Not Found" }, 404);
+      }
+    });
   }
 
   /** Create a fresh code for a device (replacing its previous one) */
@@ -115,8 +121,12 @@ export class PairingIndex implements DurableObject {
     return json({ code, expiresAt, expiresIn: Math.floor(PAIRING_CODE_TTL_MS / 1000) });
   }
 
-  /** Exchange a code for its device ID, once */
-  private async redeem(code: string, ip: string): Promise<Response> {
+  /**
+   * Exchange a code for its device ID, once. With `expectedDeviceId` (sign-in
+   * started from a device-specific URL) a code for another device counts as
+   * a wrong guess and stays valid for its own device.
+   */
+  private async redeem(code: string, ip: string, expectedDeviceId?: string): Promise<Response> {
     const now = Date.now();
     const ipKey = `fail-ip:${ip}`;
     const globalKey = "fail-global";
@@ -142,8 +152,10 @@ export class PairingIndex implements DurableObject {
       entry = await this.state.storage.get<PairingEntry>(key);
     }
 
-    if (!entry || entry.expiresAt <= now) {
-      if (entry) {
+    const expired = !!entry && entry.expiresAt <= now;
+    const otherDevice = !!entry && !expired && !!expectedDeviceId && entry.deviceId !== expectedDeviceId;
+    if (!entry || expired || otherDevice) {
+      if (expired && entry) {
         await this.state.storage.delete(key);
         await this.state.storage.delete(`device:${entry.deviceId}`);
       }
@@ -180,9 +192,11 @@ export class PairingIndex implements DurableObject {
         if (current === key) await this.state.storage.delete(`device:${entry.deviceId}`);
       }
     }
-    const windows = await this.state.storage.list<Window>({ prefix: "fail-ip:" });
-    for (const [key, window] of windows) {
-      if (window.resetAt <= now) await this.state.storage.delete(key);
+    for (const prefix of ["fail-ip:", "mints:"]) {
+      const windows = await this.state.storage.list<Window>({ prefix });
+      for (const [key, window] of windows) {
+        if (window.resetAt <= now) await this.state.storage.delete(key);
+      }
     }
   }
 

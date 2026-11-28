@@ -245,16 +245,17 @@ app.post("/authorize", async (c) => {
       const res = await stub.fetch(new Request("http://internal/redeem", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code: pairingCode, ip: c.req.header("CF-Connecting-IP") || "unknown" }),
+        body: JSON.stringify({
+          code: pairingCode,
+          ip: c.req.header("CF-Connecting-IP") || "unknown",
+          deviceId: lockedDeviceId,
+        }),
       }));
       const body = await res.json() as { deviceId?: string; error?: string };
       if (!res.ok || !body.deviceId) {
         return fail(body.error || "That code didn't work. Get a new one on your reader.", res.status === 429 ? 429 : 401);
       }
       deviceId = body.deviceId;
-      if (lockedDeviceId && deviceId !== lockedDeviceId) {
-        return fail("That code belongs to a different reader.");
-      }
     } else {
       deviceId = lockedDeviceId || deviceIdInput;
       if (!deviceId || !passcode) {
@@ -364,14 +365,18 @@ app.get("/connected-apps", async (c) => {
   const auth = await authenticateDeviceRequest(c);
   if ("error" in auth) return auth.error;
   const apps: { id: string; name: string; connectedAt: number }[] = [];
+  const clientNames = new Map<string, string>();
   let cursor: string | undefined;
   do {
     const page = await c.env.OAUTH_PROVIDER.listUserGrants(auth.deviceId, { limit: 100, cursor });
     for (const grant of page.items) {
       let name = typeof grant.metadata?.clientName === "string" ? grant.metadata.clientName : "";
       if (!name) {
-        const client = await c.env.OAUTH_PROVIDER.lookupClient(grant.clientId);
-        name = client?.clientName || "Unknown app";
+        if (!clientNames.has(grant.clientId)) {
+          const client = await c.env.OAUTH_PROVIDER.lookupClient(grant.clientId);
+          clientNames.set(grant.clientId, client?.clientName || "Unknown app");
+        }
+        name = clientNames.get(grant.clientId)!;
       }
       apps.push({ id: grant.id, name, connectedAt: grant.createdAt });
     }
