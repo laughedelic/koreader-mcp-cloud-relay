@@ -307,6 +307,15 @@ app.post("/authorize", async (c) => {
       props: demo ? { deviceId, demoSession: crypto.randomUUID() } : { deviceId },
     });
     console.log(JSON.stringify({ event: "authorize", deviceId, method: demo ? "demo" : pairingCode ? "pairing-code" : "passcode", clientName }));
+    // Tell the reader, so it can close the pairing code and show who connected
+    if (!demo) {
+      const stub = c.env.MCP_RELAY.get(c.env.MCP_RELAY.idFromName(deviceId));
+      c.executionCtx.waitUntil(stub.fetch(new Request(`http://internal/${deviceId}/notify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event: "app_connected", name: clientName || "An AI app" }),
+      })).catch(error => console.error("notify error:", error)));
+    }
     return c.redirect(redirectTo, 302);
   } catch (error) {
     console.error("completeAuthorization error:", error);
@@ -573,7 +582,8 @@ app.all("/:deviceId/*", async (c) => {
 
   // Internal-only endpoints are never reachable from outside, and the demo
   // reader has no device endpoints (nobody may register or poll as it)
-  if (action === "verify-passcode" || action === "device-auth" || deviceId.toLowerCase() === DEMO_DEVICE_ID) {
+  if (action === "verify-passcode" || action === "device-auth" || action === "notify"
+      || deviceId.toLowerCase() === DEMO_DEVICE_ID) {
     return c.json({ error: { code: "NOT_FOUND", message: "Not Found" } }, 404);
   }
 
