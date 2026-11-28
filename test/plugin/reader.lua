@@ -28,7 +28,6 @@ function G_reader_settings:flush() end
 local state = { page = 118 }
 local doc = { file = "/books/secret-file-name.epub" }
 function doc:getProps() return { title = "The Test Book", authors = "A. Writer", language = "en", description = "A test." } end
-function doc:getCurrentPage() return state.page end
 function doc:getPageCount() return 300 end
 function doc:getToc() return {
     { title = "Chapter One", page = 1, depth = 1 }, { title = "Chapter Seven", page = 110, depth = 1 },
@@ -40,6 +39,9 @@ local ui = { document = doc, annotation = { annotations = {
     { text = "The lighthouse was dark", page = "/body/p[9]", pageno = 118, chapter = "Chapter Seven",
       datetime = "2026-11-27 21:00:00", drawer = "lighten" },
 } } }
+-- The current page comes from the reader UI: KOReader's PDF documents have
+-- no getCurrentPage() of their own
+function ui:getCurrentPage() return state.page end
 
 local protocol = require("mcp_protocol"):new()
 local resources = require("mcp_resources"):new()

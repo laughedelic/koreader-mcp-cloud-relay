@@ -9,13 +9,13 @@ local cjson = require("cjson")
 local page = 50
 local doc = { file = "/x/y.pdf" }
 function doc:getProps() return { title = "Big", authors = { "A", "B" }, description = string.rep("d", 5000) } end
-function doc:getCurrentPage() return page end
 function doc:getPageCount() return 60 end
 function doc:getToc() local t = {} for i = 1, 400 do t[i] = { title = "Chapter " .. i .. " é", page = i, depth = i % 3 + 1 } end return t end
 local annotations = {}
 for i = 1, 300 do annotations[i] = { text = string.rep("h", 200), note = i % 2 == 0 and "note " .. i or nil, page = i % 60 + 1, datetime = string.format("2026-11-%02d 10:00:%02d", i % 28 + 1, i % 60) } end
 annotations[#annotations + 1] = { page = 3, datetime = "2026-01-01 00:00:00" } -- plain bookmark: skipped
 local ui = { document = doc, annotation = { annotations = annotations } }
+function ui:getCurrentPage() return page end
 local options = { scope = "pages", retention_days = 30, page_text = function(n) return string.rep("p" .. n .. " ", 8000) end }
 
 local s = Snapshot.build(ui, options)
