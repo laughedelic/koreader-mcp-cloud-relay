@@ -322,11 +322,18 @@ Settings in `wrangler.toml` (`[vars]`):
 
 ## Testing
 
-`test/e2e.mjs` plays a reader and two AI apps against a local relay: pairing, live requests, snapshots, offline answers for every tool, a second app, token refresh, disconnecting an app, forgetting the saved copy and the size limits. It needs Node 20 or newer and takes about a minute.
+Both tests run against a local relay (`bun run dev`) and need Node 20 or newer.
+
+`test/e2e.mjs` plays a reader and two AI apps: pairing, live requests, snapshots, offline answers for every tool, a second app, token refresh, disconnecting an app, forgetting the saved copy and the size limits. It takes about a minute.
 
 ```bash
-bun run dev          # in one terminal
-bun run test:e2e     # in another
+bun run test:e2e
+```
+
+`test/plugin/run.sh` runs the KOReader plugin's own code (relay client, MCP tools, offline memory) against the relay, with KOReader's modules replaced by small stubs and a made-up open book, while a Node script plays the AI app. It needs a checkout of [mcp.koplugin](https://github.com/laughedelic/mcp.koplugin) and `luajit` with `luasocket`, `luasec` and `lua-cjson`. It takes about two minutes.
+
+```bash
+test/plugin/run.sh /path/to/mcp.koplugin
 ```
 
 ## Cost Estimation (Cloudflare Free Tier)
