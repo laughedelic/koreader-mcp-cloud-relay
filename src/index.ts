@@ -14,6 +14,7 @@ import type { Env } from "./types";
 
 // Re-export the Durable Object class
 export { MCPRelay } from "./relay";
+export { PairingIndex } from "./pairing";
 
 /**
  * MCP API Handler - handles authenticated MCP requests

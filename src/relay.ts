@@ -230,7 +230,12 @@ export class MCPRelay implements DurableObject {
           ? this.handleStatus()
           : this.methodNotAllowed();
 
-      // Internal endpoint for OAuth authorization flow
+      // Internal endpoints (reached only from the Worker, never routed from outside)
+      case "device-auth":
+        return request.method === "POST"
+          ? this.handleDeviceAuth(request)
+          : this.methodNotAllowed();
+
       case "verify-passcode":
         return request.method === "POST"
           ? this.handleVerifyPasscode(request)
@@ -353,6 +358,7 @@ export class MCPRelay implements DurableObject {
       version: body.version,
       passcodeHash,
       deviceSecretHash,
+      pairingCodes: this.deviceInfo?.pairingCodes,
       registeredAt: this.deviceInfo?.registeredAt || Date.now(),
     };
     this.lastPollTime = Date.now();
@@ -379,6 +385,8 @@ export class MCPRelay implements DurableObject {
     };
     
     response.deviceSecretRegistered = !!deviceSecretHash;
+    // Tells the plugin it can offer "Connect an AI app" (one-time codes)
+    response.pairingCodesSupported = true;
     if (!isReconnection) {
       response.message = "Device registered successfully. Use the passcode you generated to authenticate MCP clients.";
     }
@@ -446,6 +454,14 @@ export class MCPRelay implements DurableObject {
       return this.jsonResponse({ valid: false, error: "Device has no credentials" }, 401);
     }
 
+    // Devices that pair with one-time codes no longer accept the permanent passcode
+    if (this.deviceInfo.pairingCodes) {
+      return this.jsonResponse({
+        valid: false,
+        error: "This reader uses pairing codes. On the reader, open MCP server > Connect an AI app and enter the code it shows.",
+      }, 401);
+    }
+
     // Brute-force protection: after a few failures, lock out with exponential backoff
     const lockout = await this.checkPasscodeLockout();
     if (lockout) {
@@ -463,6 +479,31 @@ export class MCPRelay implements DurableObject {
 
     await this.clearPasscodeFailures();
     return this.jsonResponse({ valid: true });
+  }
+
+  /**
+   * POST /device-auth - Internal: authenticate a device request for the Worker
+   * (pairing codes, connected apps). Always requires the device secret.
+   * Body: { enablePairingCodes?: boolean } turns off passcode login for good.
+   */
+  private async handleDeviceAuth(request: Request): Promise<Response> {
+    if (!this.deviceInfo) {
+      return this.jsonError("Not registered", "NOT_REGISTERED", 410);
+    }
+    const authError = await this.authenticateDevice(request, true);
+    if (authError) return authError;
+
+    let body: { enablePairingCodes?: boolean } = {};
+    try {
+      body = await request.json();
+    } catch {
+      // empty body is fine
+    }
+    if (body.enablePairingCodes && !this.deviceInfo.pairingCodes) {
+      this.deviceInfo.pairingCodes = true;
+      await this.state.storage.put("deviceInfo", this.deviceInfo);
+    }
+    return this.jsonResponse({ ok: true, deviceId: this.deviceInfo.deviceId });
   }
 
   // ============================================
