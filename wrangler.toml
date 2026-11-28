@@ -18,10 +18,18 @@ REQUIRE_DEVICE_SECRET = "false"
 name = "MCP_RELAY"
 class_name = "MCPRelay"
 
+[[durable_objects.bindings]]
+name = "PAIRING_INDEX"
+class_name = "PairingIndex"
+
 # Migrations for Durable Objects
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["MCPRelay"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PairingIndex"]
 
 # Development settings
 [dev]

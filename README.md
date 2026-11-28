@@ -4,7 +4,7 @@ A secure HTTP long-polling relay that enables remote access to KOReader MCP serv
 
 ## Features
 
-- **OAuth 2.1 Authentication (Authorization Code + PKCE)**: Secure access with device-generated passcodes
+- **OAuth 2.1 Authentication (Authorization Code + PKCE)**: Pair an AI app with a one-time 6-digit code shown on the reader
 - **MCP Authorization Compliant**: Implements RFC 9728 Protected Resource Metadata
 - **HTTP Long-Polling**: Works with any HTTP client (no WebSocket required)
 - **Cloudflare Durable Objects**: Persistent device state and request queuing
@@ -78,11 +78,18 @@ curl -X POST https://mcp-relay.example.com/register \
 }
 ```
 
-The passcode is displayed to the user on their device. They need to enter it in their MCP client (Claude Desktop, etc.) for authentication.
+The passcode hash only anchors the device's identity for older plugins; current plugins pair with one-time codes instead (below).
 
-### 2. Getting an Access Token
+### 2. Pairing an AI app
 
-MCP clients authenticate using OAuth 2.1 Authorization Code flow with PKCE.
+MCP clients authenticate using OAuth 2.1 Authorization Code flow with PKCE. The sign-in page (`/authorize`) asks for a **one-time pairing code**:
+
+1. On the reader, the user opens **MCP server → Connect an AI app**. The plugin calls `POST /pairing-code` (authenticated with the device secret) and shows the 6-digit code it gets back.
+2. The user enters the code on the sign-in page. The relay looks it up, deletes it, and issues the OAuth grant for that device.
+
+A code is single use, expires after 10 minutes, and a device has at most one live code (asking again replaces it). Since the code alone picks the device, wrong codes are limited to 10 per IP and 100 relay-wide per 10 minutes. The code is only a pairing token: the lasting credential is the client's OAuth token, which the user can revoke from the reader (**Connected apps**).
+
+Once a device has requested a pairing code, its permanent passcode stops working for new sign-ins. Older plugins keep using the device ID and passcode form (under "Older plugin?" on the sign-in page).
 
 ### 3. Making Authenticated MCP Requests
 
@@ -134,6 +141,16 @@ The relay implements RFC 9728 Protected Resource Metadata:
 
 Your relay will be available at: `https://mcp-relay.<your-subdomain>.workers.dev/`
 
+### Demo reader (optional)
+
+Set a secret pairing code of 8 to 16 digits to enable a built-in demo reader:
+
+```bash
+bun run wrangler secret put DEMO_PAIRING_CODE
+```
+
+Signing in with that code connects the AI app to `demo-reader`, which the Worker answers itself with the plugin's tools, resources and prompts over a public-domain sample book (*Alice's Adventures in Wonderland*, chapters I to III). It exists so connector directory reviewers can try every tool without an e-reader. Page turns and highlights live only in the Worker's memory, separately for each sign-in. The demo code counts against the same wrong-guess limits as pairing codes, and removing the secret turns the demo off, including for apps already signed in. It speaks MCP 2025-03-26 to 2025-11-25. The tool definitions come from the plugin (`src/demo-data.json`); regenerate them when the plugin's tools change.
+
 ## API Endpoints
 
 ### `GET /`
@@ -158,10 +175,13 @@ Returns relay info and available endpoints.
 | `/response` | POST   | Send response to a forwarded request |
 | `/pong`     | POST   | Keep-alive heartbeat (optional)      |
 | `/status`   | GET    | Check if the device is online        |
+| `/pairing-code` | POST | Get a one-time pairing code (`{code, expiresAt, expiresIn, relayUrl}`) |
+| `/connected-apps` | GET | List authorized AI apps (`{apps: [{id, name, connectedAt}]}`, `connectedAt` in Unix seconds) |
+| `/connected-apps/{id}` | DELETE | Disconnect an AI app (revokes its grant and tokens) |
 
 All device endpoints require the `X-Device-Id` header (except `/register`, which includes `deviceId` in the JSON body).
 
-`/poll`, `/response`, `/pong` and `/status` also require `Authorization: Device <deviceSecret>`, using the secret the device sent at registration. Re-registering a device that has a secret requires the same secret. `/status` always requires the secret.
+`/poll`, `/response`, `/pong`, `/status`, `/pairing-code` and `/connected-apps` also require `Authorization: Device <deviceSecret>`, using the secret the device sent at registration. Re-registering a device that has a secret requires the same secret. `/status`, `/pairing-code` and `/connected-apps` always require the secret.
 
 While `REQUIRE_DEVICE_SECRET` is `"false"` (the default, for compatibility), any registration without `deviceSecret` is accepted, new or old, and that device's `/poll`, `/response` and `/pong` calls are not authenticated. Such a device upgrades by re-registering with a secret and its passcode hash. Set `REQUIRE_DEVICE_SECRET = "true"` in `wrangler.toml` to reject secretless registrations and unauthenticated device calls.
 
@@ -175,7 +195,14 @@ Only protocol headers (`Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Me
 
 ## Security
 
-### Passcode Security
+### Pairing Code Security
+
+- **Single use, 10 minutes**: a code is deleted when redeemed or replaced, and expires on its own
+- **Guessing capped relay-wide**: 10 wrong codes per IP and 100 in total per 10 minutes
+- **Minted only by the device**: requesting a code requires the device secret
+- **Stored hashed**: the relay keys codes by their SHA-256 hash
+
+### Legacy Passcode Security
 
 - **Device-generated**: Passcode is generated and displayed only on the device
 - **Zero-knowledge**: Relay only receives and stores the SHA-256 hash

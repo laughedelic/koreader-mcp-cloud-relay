@@ -80,6 +80,9 @@ export interface DeviceInfo {
   passcodeHash?: string;
   // SHA-256 of the device secret that authenticates /poll, /response, /pong
   deviceSecretHash?: string;
+  // True once the device has used one-time pairing codes; the permanent
+  // passcode then no longer signs in new clients
+  pairingCodes?: boolean;
   registeredAt?: number;
 }
 
@@ -106,8 +109,13 @@ export interface ErrorResponse {
 
 export interface Env {
   MCP_RELAY: DurableObjectNamespace;
+  // Single global instance mapping one-time pairing codes to device IDs
+  PAIRING_INDEX: DurableObjectNamespace;
   // KV namespace for OAuth state (tokens, clients, authorization codes)
   OAUTH_KV: KVNamespace;
   // "true" to reject devices that never registered a device secret
   REQUIRE_DEVICE_SECRET?: string;
+  // Secret pairing code (8+ digits) that signs in to the built-in demo reader;
+  // unset means no demo. Set with: wrangler secret put DEMO_PAIRING_CODE
+  DEMO_PAIRING_CODE?: string;
 }

@@ -2,12 +2,14 @@
  * OAuth Authorization Handler
  * 
  * Implements the /authorize endpoint for MCP OAuth 2.1 Authorization Code flow.
- * Users authenticate by entering the passcode displayed on their KOReader device.
+ * Users authenticate with a one-time pairing code shown on their KOReader
+ * device (or, for older plugins, the device ID and permanent passcode).
  */
 
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { Hono } from "hono";
 import type { Env } from "./types";
+import { DEMO_DEVICE_ID } from "./demo";
 
 interface AuthEnv extends Env {
   OAUTH_PROVIDER: OAuthHelpers;
@@ -38,336 +40,366 @@ function extractDeviceIdFromResource(resource: string | undefined): string | nul
   return null;
 }
 
+/** Escape text for HTML element content and quoted attribute values */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+const DEVICE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{4,22}[a-z0-9]$/i;
+
+interface LoginPageOptions {
+  oauthState: string;
+  clientName?: string;
+  error?: string;
+  lockedDeviceId?: string;
+  legacyDeviceId?: string;
+  showLegacy?: boolean;
+}
+
+function renderLoginPage(opts: LoginPageOptions): string {
+  const client = opts.clientName ? escapeHtml(opts.clientName.slice(0, 80)) : "Your AI app";
+  const legacyOpen = opts.showLegacy || !!opts.lockedDeviceId;
+  const deviceIdField = opts.lockedDeviceId
+    ? `<input type="hidden" name="device_id" value="${escapeHtml(opts.lockedDeviceId)}">
+       <div class="device-info">Connecting to device: <code>${escapeHtml(opts.lockedDeviceId)}</code></div>`
+    : `<div class="form-group">
+         <label for="device_id">Device ID</label>
+         <input type="text" id="device_id" name="device_id" placeholder="e.g., kindle-a1b2c3d4"
+           value="${escapeHtml(opts.legacyDeviceId || "")}" autocomplete="username"
+           autocapitalize="none" spellcheck="false">
+       </div>`;
+
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Connect to KOReader</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: #f6f7f9; min-height: 100vh; margin: 0; padding: 24px;
+        display: flex; align-items: center; justify-content: center; color: #111827;
+      }
+      .card {
+        background: #fff; border-radius: 12px; padding: 28px; width: 100%; max-width: 420px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+      }
+      h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
+      .subtitle { color: #4b5563; margin: 0 0 20px; font-size: 14px; line-height: 1.5; }
+      .error {
+        background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
+        padding: 10px 12px; border-radius: 8px; margin-bottom: 16px; font-size: 13px;
+      }
+      .form-group { margin-bottom: 14px; }
+      label { display: block; font-weight: 500; margin-bottom: 6px; color: #374151; font-size: 13px; }
+      input[type="text"], input[type="password"] {
+        width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px;
+        font-size: 15px; background: #fff;
+      }
+      input.code {
+        font-size: 28px; letter-spacing: 0.3em; text-align: center; padding: 12px;
+        font-family: "SF Mono", Monaco, Menlo, monospace;
+      }
+      input:focus { outline: none; border-color: #111827; box-shadow: 0 0 0 3px rgba(17,24,39,0.08); }
+      .hint { font-size: 12px; color: #6b7280; margin-top: 6px; }
+      button {
+        width: 100%; margin-top: 18px; padding: 11px 20px; border: none; border-radius: 8px;
+        background: #111827; color: #fff; font-size: 15px; font-weight: 500; cursor: pointer;
+      }
+      details { margin-top: 22px; border-top: 1px solid #e5e7eb; padding-top: 14px; }
+      summary { cursor: pointer; font-size: 13px; color: #4b5563; }
+      details .form-group:first-of-type { margin-top: 14px; }
+      .device-info {
+        background: #f9fafb; border: 1px solid #e5e7eb; padding: 10px 12px; border-radius: 8px;
+        margin: 14px 0; font-size: 13px; color: #4b5563;
+      }
+      code { font-family: "SF Mono", Monaco, monospace; background: #e5e7eb; padding: 2px 6px; border-radius: 4px; color: #111827; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Connect to KOReader</h1>
+      <p class="subtitle">${client} wants to read the book open on your e-reader.
+        On the reader, open <strong>MCP server &rsaquo; Connect an AI app</strong> and enter the code it shows.</p>
+
+      ${opts.error ? `<div class="error">${escapeHtml(opts.error)}</div>` : ""}
+
+      <form method="POST" action="/authorize">
+        <input type="hidden" name="oauth_state" value="${escapeHtml(opts.oauthState)}">
+
+        <div class="form-group">
+          <label for="pairing_code">Pairing code</label>
+          <input type="text" class="code" id="pairing_code" name="pairing_code"
+            inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,16}" maxlength="16"
+            placeholder="000000" ${legacyOpen ? "" : "autofocus"}>
+          <p class="hint">6 digits, valid for 10 minutes.</p>
+        </div>
+
+        <details ${legacyOpen ? "open" : ""}>
+          <summary>Older plugin? Use device ID and passcode</summary>
+          ${deviceIdField}
+          <div class="form-group">
+            <label for="passcode">Passcode</label>
+            <input type="password" id="passcode" name="passcode" inputmode="numeric"
+              pattern="[0-9]{6}" maxlength="6" autocomplete="current-password">
+          </div>
+        </details>
+
+        <button type="submit">Connect</button>
+      </form>
+    </div>
+  </body>
+</html>`;
+}
+
+/** The demo code: a configured secret of 8+ digits, compared in constant time */
+function isDemoCode(code: string, demo: string | undefined): boolean {
+  if (!demo || !/^\d{8,16}$/.test(demo) || code.length !== demo.length) return false;
+  let diff = 0;
+  for (let i = 0; i < code.length; i++) diff |= code.charCodeAt(i) ^ demo.charCodeAt(i);
+  return diff === 0;
+}
+
+function encodeOAuthState(info: AuthRequest): string {
+  return btoa(JSON.stringify(info));
+}
+
 /**
  * GET /authorize - OAuth authorization endpoint
- * 
- * Shows a login form where users enter the device ID and passcode
- * from their KOReader device.
+ *
+ * Shows the sign-in form: a one-time pairing code from the reader, or (for
+ * older plugins) the device ID and permanent passcode.
  */
 app.get("/authorize", async (c) => {
   const oauthReqInfo: AuthRequest = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
-  
-  // Debug logging
-  console.log("OAuth Request Info:", JSON.stringify(oauthReqInfo, null, 2));
-  
   const clientInfo = await c.env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
-
   if (!clientInfo) {
     return c.text("Invalid client_id", 400);
   }
 
-  // Extract device ID from resource URL
   const resource = Array.isArray(oauthReqInfo.resource) ? oauthReqInfo.resource[0] : oauthReqInfo.resource;
   const resourceDeviceId = extractDeviceIdFromResource(resource);
-  
-  console.log("Resource:", resource, "Extracted device ID:", resourceDeviceId);
-  
-  // Check for error from failed login attempt
-  const error = c.req.query("error");
-  const requestedDeviceId = (c.req.query("device_id") || "").toLowerCase();
-  const errorDeviceId = error ? requestedDeviceId : "";
-  const queryDeviceId = !error ? requestedDeviceId : "";
-  
-  // Use device ID from: 1) error redirect, 2) query param, 3) resource URL, 4) empty
-  const deviceId = errorDeviceId || queryDeviceId || resourceDeviceId || "";
-  const deviceIdLocked = (!!resourceDeviceId || !!queryDeviceId) && !errorDeviceId;
 
-  const loginPage = `
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Connect to KOReader</title>
-        <style>
-          * { box-sizing: border-box; }
-          body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f6f7f9;
-            min-height: 100vh;
-            margin: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 24px;
-            color: #111827;
-          }
-          .card {
-            background: #ffffff;
-            border-radius: 12px;
-            padding: 28px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.08);
-            max-width: 420px;
-            width: 100%;
-          }
-          h1 {
-            margin: 0 0 6px;
-            color: #111827;
-            font-size: 20px;
-            font-weight: 600;
-          }
-          .subtitle {
-            color: #6b7280;
-            margin-bottom: 20px;
-            font-size: 14px;
-          }
-          .error {
-            background: #fef2f2;
-            border: 1px solid #fecaca;
-            color: #b91c1c;
-            padding: 10px 12px;
-            border-radius: 8px;
-            margin-bottom: 16px;
-            font-size: 13px;
-          }
-          .form-group {
-            margin-bottom: 14px;
-          }
-          label {
-            display: block;
-            font-weight: 500;
-            margin-bottom: 6px;
-            color: #374151;
-            font-size: 13px;
-          }
-          input[type="text"], input[type="password"] {
-            width: 100%;
-            padding: 10px 12px;
-            border: 1px solid #d1d5db;
-            border-radius: 8px;
-            font-size: 15px;
-            background: #fff;
-          }
-          input:focus {
-            outline: none;
-            border-color: #111827;
-            box-shadow: 0 0 0 3px rgba(17, 24, 39, 0.08);
-          }
-          input[readonly] {
-            background: #f9fafb;
-            color: #6b7280;
-          }
-          .hint {
-            font-size: 12px;
-            color: #9ca3af;
-            margin-top: 4px;
-          }
-          .actions {
-            display: flex;
-            gap: 10px;
-            margin-top: 24px;
-          }
-          button {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-          }
-          .connect {
-            background: #111827;
-            color: white;
-            flex: 1;
-          }
-          .connect:hover {
-            background: #0f172a;
-          }
-          .cancel {
-            background: #f0f0f0;
-            color: #666;
-          }
-          .cancel:hover {
-            background: #e5e5e5;
-          }
-          .device-info {
-            background: #f9fafb;
-            border: 1px solid #e5e7eb;
-            padding: 10px 12px;
-            border-radius: 8px;
-            margin-bottom: 16px;
-            font-size: 13px;
-            color: #6b7280;
-          }
-          .device-info code {
-            color: #111827;
-            font-family: "SF Mono", Monaco, monospace;
-            background: #e5e7eb;
-            padding: 2px 6px;
-            border-radius: 4px;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>Connect to KOReader</h1>
-          <p class="subtitle">Enter the credentials shown on your reading device.</p>
-
-          ${deviceIdLocked ? `
-          <div class="device-info">
-            Connecting to device: <code>${deviceId}</code>
-          </div>
-          ` : ""}
-
-          ${error ? `<div class="error">${c.req.query("error_message") || "Invalid device ID or passcode. Please check and try again."}</div>` : ""}
-
-          <form method="POST" action="/authorize">
-            <input type="hidden" name="oauth_state" value="${btoa(JSON.stringify(oauthReqInfo))}">
-            
-            ${deviceIdLocked ? `
-            <input type="hidden" name="device_id" value="${deviceId}">
-            ` : `
-            <div class="form-group">
-              <label for="device_id">Device ID</label>
-              <input 
-                type="text" 
-                id="device_id" 
-                name="device_id" 
-                placeholder="e.g., kindle-a1b2"
-                value="${deviceId}"
-                required
-                pattern="[a-zA-Z0-9][a-zA-Z0-9\\-]{4,22}[a-zA-Z0-9]"
-                autocomplete="username"
-              >
-              <p class="hint">Shown in KOReader: Settings → Network → MCP Server</p>
-            </div>
-            `}
-
-            <div class="form-group">
-              <label for="passcode">Passcode</label>
-              <input 
-                type="password" 
-                id="passcode" 
-                name="passcode" 
-                placeholder="6-digit code"
-                required
-                minlength="6"
-                maxlength="6"
-                pattern="[0-9]{6}"
-                autocomplete="current-password"
-                autofocus
-              >
-              <p class="hint">6-digit code shown on your device</p>
-            </div>
-
-            <div class="actions">
-              <button type="submit" class="connect">Connect</button>
-            </div>
-          </form>
-        </div>
-      </body>
-    </html>
-  `;
-
-  return c.html(loginPage);
+  return c.html(renderLoginPage({
+    oauthState: encodeOAuthState(oauthReqInfo),
+    clientName: clientInfo.clientName,
+    lockedDeviceId: resourceDeviceId || undefined,
+  }));
 });
 
 /**
- * POST /authorize - Handle authorization form submission
- * 
- * Verifies the device ID and passcode, then completes the OAuth flow.
+ * POST /authorize - Handle the sign-in form
+ *
+ * Resolves the device from the pairing code (or device ID + passcode),
+ * then completes the OAuth flow. Errors re-render the form in place.
  */
 app.post("/authorize", async (c) => {
   const formData = await c.req.formData();
-  const oauthState = formData.get("oauth_state");
-  const deviceIdRaw = formData.get("device_id");
-  const passcodeRaw = formData.get("passcode");
-  const deviceId = typeof deviceIdRaw === "string" ? deviceIdRaw.trim().toLowerCase() : "";
-  const passcode = typeof passcodeRaw === "string" ? passcodeRaw.trim() : "";
+  const field = (name: string) => {
+    const value = formData.get(name);
+    return typeof value === "string" ? value.trim() : "";
+  };
+  const oauthState = field("oauth_state");
+  const pairingCode = field("pairing_code").replace(/\s+/g, "");
+  const deviceIdInput = field("device_id").toLowerCase();
+  const passcode = field("passcode");
 
-  if (!oauthState || typeof oauthState !== "string") {
+  if (!oauthState) {
     return c.text("Missing OAuth state", 400);
   }
-
-  if (!deviceId || !passcode) {
-    return c.text("Missing device ID or passcode", 400);
-  }
-
   let oauthReqInfo: AuthRequest;
   try {
     oauthReqInfo = JSON.parse(atob(oauthState));
   } catch {
     return c.text("Invalid OAuth state", 400);
   }
+  const clientInfo = await c.env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
+  if (!clientInfo) {
+    return c.text("Invalid client_id", 400);
+  }
+  const resource = Array.isArray(oauthReqInfo.resource) ? oauthReqInfo.resource[0] : oauthReqInfo.resource;
+  const lockedDeviceId = extractDeviceIdFromResource(resource) || undefined;
 
-  // Verify credentials with the device's Durable Object
-  const doId = c.env.MCP_RELAY.idFromName(deviceId);
-  const stub = c.env.MCP_RELAY.get(doId);
-  
+  const fail = (error: string, status: 400 | 401 | 429 | 500 = 401, showLegacy = false) => c.html(renderLoginPage({
+    oauthState,
+    clientName: clientInfo.clientName,
+    error,
+    lockedDeviceId,
+    legacyDeviceId: deviceIdInput,
+    showLegacy,
+  }), status);
+
+  let deviceId: string;
+  let demo = false;
   try {
-    // The DO expects paths like /{deviceId}/verify-passcode
-    const verifyResponse = await stub.fetch(new Request(`http://internal/${deviceId}/verify-passcode`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ passcode }),
-    }));
-
-    if (!verifyResponse.ok) {
-      let errorMessage = "Invalid device ID or passcode.";
-      try {
-        const body = await verifyResponse.json() as { error?: string; message?: string };
-        if (body?.error) errorMessage = body.error;
-        if (body?.message) errorMessage = body.message;
-      } catch {
-        // ignore parsing errors
+    if (pairingCode) {
+      // The demo code goes through the same guess limits as pairing codes
+      // On a sign-in locked to another reader the demo code is just a wrong
+      // guess, counted like any other so it reveals nothing
+      demo = isDemoCode(pairingCode, c.env.DEMO_PAIRING_CODE)
+        && (!lockedDeviceId || lockedDeviceId === DEMO_DEVICE_ID);
+      const stub = c.env.PAIRING_INDEX.get(c.env.PAIRING_INDEX.idFromName("global"));
+      const res = await stub.fetch(new Request("http://internal/redeem", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          code: pairingCode,
+          ip: c.req.header("CF-Connecting-IP") || "unknown",
+          deviceId: lockedDeviceId,
+          demo,
+        }),
+      }));
+      const body = await res.json() as { deviceId?: string; demo?: boolean; error?: string };
+      if (!res.ok || !(body.deviceId || (demo && body.demo))) {
+        return fail(body.error || "That code didn't work. Get a new one on your reader.", res.status === 429 ? 429 : 401);
       }
-      // Redirect back to authorize with error
-      const url = new URL(c.req.url);
-      url.searchParams.set("error", "invalid_credentials");
-      url.searchParams.set("error_message", errorMessage);
-      url.searchParams.set("device_id", deviceId);
-      // Preserve original OAuth parameters
-      for (const [key, value] of Object.entries(oauthReqInfo)) {
-        if (typeof value === "string") {
-          url.searchParams.set(key, value);
-        } else if (Array.isArray(value)) {
-          url.searchParams.set(key, value.join(" "));
+      deviceId = demo ? DEMO_DEVICE_ID : body.deviceId!;
+    } else {
+      deviceId = lockedDeviceId || deviceIdInput;
+      if (!deviceId || !passcode) {
+        return fail("Enter the pairing code shown on your reader.", 400, !!(deviceIdInput || passcode));
+      }
+      if (!DEVICE_ID_PATTERN.test(deviceId)) {
+        return fail("Invalid device ID or passcode.", 401, true);
+      }
+      const stub = c.env.MCP_RELAY.get(c.env.MCP_RELAY.idFromName(deviceId));
+      const res = await stub.fetch(new Request(`http://internal/${deviceId}/verify-passcode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ passcode }),
+      }));
+      if (!res.ok) {
+        let message = "Invalid device ID or passcode.";
+        try {
+          const body = await res.json() as { error?: string };
+          if (body?.error) message = body.error;
+        } catch {
+          // keep the generic message
         }
+        return fail(message, res.status === 429 ? 429 : 401, true);
       }
-      return c.redirect(url.toString(), 302);
     }
   } catch (error) {
-    console.error("Verify passcode error:", error);
-    const url = new URL(c.req.url);
-    url.searchParams.set("error", "server_error");
-    url.searchParams.set("error_message", "Failed to verify credentials. Please try again.");
-    url.searchParams.set("device_id", deviceId);
-    for (const [key, value] of Object.entries(oauthReqInfo)) {
-      if (typeof value === "string") {
-        url.searchParams.set(key, value);
-      } else if (Array.isArray(value)) {
-        url.searchParams.set(key, value.join(" "));
-      }
-    }
-    return c.redirect(url.toString(), 302);
+    console.error("Sign-in verification error:", error);
+    return fail("Couldn't check the code. Please try again.", 500);
   }
 
-  // Credentials valid - complete OAuth authorization
-  console.log("Completing authorization for device:", deviceId);
-  console.log("OAuth request info:", JSON.stringify(oauthReqInfo, null, 2));
-  
+  const clientName = (clientInfo.clientName || "").slice(0, 80);
   try {
     const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
       request: oauthReqInfo,
       userId: deviceId,
       metadata: {
         label: `KOReader: ${deviceId}`,
-        deviceId: deviceId,
+        deviceId,
+        clientName,
+        method: demo ? "demo" : pairingCode ? "pairing-code" : "passcode",
       },
       scope: oauthReqInfo.scope,
-      props: {
-        deviceId: deviceId,
-      },
+      // demoSession marks demo grants and keeps each one's demo state apart
+      props: demo ? { deviceId, demoSession: crypto.randomUUID() } : { deviceId },
     });
-
-    console.log("Authorization completed, redirecting to:", redirectTo);
-    
-    // Redirect back to the MCP client with authorization code
+    console.log(JSON.stringify({ event: "authorize", deviceId, method: demo ? "demo" : pairingCode ? "pairing-code" : "passcode", clientName }));
     return c.redirect(redirectTo, 302);
   } catch (error) {
     console.error("completeAuthorization error:", error);
     return c.text(`Failed to complete authorization: ${error instanceof Error ? error.message : "Unknown error"}`, 500);
   }
+});
+
+// ============================================
+// Device endpoints for pairing and connected apps
+// (authenticated with the device secret via the device's Durable Object)
+// ============================================
+
+/** Authenticate a device request; returns the device ID or an error response */
+async function authenticateDeviceRequest(
+  c: { req: { header: (name: string) => string | undefined }; env: AuthEnv },
+  options: { enablePairingCodes?: boolean } = {},
+): Promise<{ deviceId: string } | { error: Response }> {
+  const deviceId = (c.req.header("X-Device-Id") || "").trim().toLowerCase();
+  if (!DEVICE_ID_PATTERN.test(deviceId) || deviceId.toLowerCase() === DEMO_DEVICE_ID) {
+    return { error: Response.json({ error: "X-Device-Id is required", code: "MISSING_DEVICE_ID" }, { status: 400 }) };
+  }
+  const stub = c.env.MCP_RELAY.get(c.env.MCP_RELAY.idFromName(deviceId));
+  const res = await stub.fetch(new Request(`http://internal/${deviceId}/device-auth`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": c.req.header("Authorization") || "",
+    },
+    body: JSON.stringify(options),
+  }));
+  if (!res.ok) {
+    // Buffered, so the device gets a Content-Length response rather than a stream
+    return { error: new Response(await res.text(), { status: res.status, headers: { "Content-Type": "application/json" } }) };
+  }
+  return { deviceId };
+}
+
+/**
+ * POST /pairing-code - Device asks for a one-time pairing code
+ * Headers: X-Device-Id, Authorization: Device <secret>
+ * Response: { code, expiresAt, expiresIn, relayUrl }
+ */
+app.post("/pairing-code", async (c) => {
+  const auth = await authenticateDeviceRequest(c, { enablePairingCodes: true });
+  if ("error" in auth) return auth.error;
+  const stub = c.env.PAIRING_INDEX.get(c.env.PAIRING_INDEX.idFromName("global"));
+  const res = await stub.fetch(new Request("http://internal/mint", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ deviceId: auth.deviceId }),
+  }));
+  const body = await res.json() as Record<string, unknown>;
+  if (res.ok) body.relayUrl = `${new URL(c.req.url).origin}/mcp`;
+  return c.json(body, res.status as 200);
+});
+
+/**
+ * GET /connected-apps - Device lists the AI apps it has authorized
+ * Response: { apps: [{ id, name, connectedAt }] }
+ */
+app.get("/connected-apps", async (c) => {
+  const auth = await authenticateDeviceRequest(c);
+  if ("error" in auth) return auth.error;
+  const apps: { id: string; name: string; connectedAt: number }[] = [];
+  const clientNames = new Map<string, string>();
+  let cursor: string | undefined;
+  do {
+    const page = await c.env.OAUTH_PROVIDER.listUserGrants(auth.deviceId, { limit: 100, cursor });
+    for (const grant of page.items) {
+      let name = typeof grant.metadata?.clientName === "string" ? grant.metadata.clientName : "";
+      if (!name) {
+        if (!clientNames.has(grant.clientId)) {
+          const client = await c.env.OAUTH_PROVIDER.lookupClient(grant.clientId);
+          clientNames.set(grant.clientId, client?.clientName || "Unknown app");
+        }
+        name = clientNames.get(grant.clientId)!;
+      }
+      apps.push({ id: grant.id, name, connectedAt: grant.createdAt });
+    }
+    cursor = page.cursor;
+  } while (cursor && apps.length < 500);
+  apps.sort((a, b) => b.connectedAt - a.connectedAt);
+  return c.json({ apps });
+});
+
+/**
+ * DELETE /connected-apps/:id - Device disconnects an AI app (revokes its grant and tokens)
+ */
+app.delete("/connected-apps/:id", async (c) => {
+  const auth = await authenticateDeviceRequest(c);
+  if ("error" in auth) return auth.error;
+  await c.env.OAUTH_PROVIDER.revokeGrant(c.req.param("id"), auth.deviceId);
+  return c.json({ ok: true });
 });
 
 /**
@@ -471,14 +503,15 @@ app.get("/", (c) => {
             
             <h2>Quick Start</h2>
             <ol>
-              <li>Enable MCP Server in KOReader (Menu → Tools → MCP Server)</li>
-              <li>Note your <strong>Device ID</strong> and <strong>Passcode</strong></li>
-              <li>Add this URL to your MCP client:</li>
+              <li>Enable the MCP server in KOReader (Menu → Tools → MCP server) with the cloud relay on</li>
+              <li>Add this URL to your AI app as a custom connector:</li>
             </ol>
             
             <div class="url-box">${baseUrl}/mcp</div>
             
-            <p style="font-size: 14px; color: #666;">This endpoint uses OAuth to select the device during login.</p>
+            <ol start="3">
+              <li>When the app asks you to sign in, open <strong>MCP server → Connect an AI app</strong> on the reader and enter the 6-digit code it shows</li>
+            </ol>
 
             <h2>OAuth Endpoints</h2>
             <div class="endpoint"><span class="method get">GET</span> /.well-known/oauth-authorization-server</div>
@@ -538,8 +571,9 @@ app.all("/:deviceId/*", async (c) => {
     }, 404);
   }
 
-  // Internal-only endpoints are never reachable from outside
-  if (action === "verify-passcode") {
+  // Internal-only endpoints are never reachable from outside, and the demo
+  // reader has no device endpoints (nobody may register or poll as it)
+  if (action === "verify-passcode" || action === "device-auth" || deviceId.toLowerCase() === DEMO_DEVICE_ID) {
     return c.json({ error: { code: "NOT_FOUND", message: "Not Found" } }, 404);
   }
 

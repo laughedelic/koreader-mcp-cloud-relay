@@ -11,9 +11,11 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { AuthHandler } from "./auth-handler";
 import type { Env } from "./types";
+import { DEMO_DEVICE_ID, handleDemoMcp } from "./demo";
 
 // Re-export the Durable Object class
 export { MCPRelay } from "./relay";
+export { PairingIndex } from "./pairing";
 
 /**
  * MCP API Handler - handles authenticated MCP requests
@@ -29,7 +31,8 @@ const mcpApiHandler = {
     const path = url.pathname;
     const pathParts = path.split("/").filter(Boolean);
     const headerDeviceId = request.headers.get("X-Device-Id") || undefined;
-    const contextDeviceId = (ctx as unknown as { props?: { deviceId?: string } })?.props?.deviceId;
+    const contextProps = (ctx as unknown as { props?: { deviceId?: string; demoSession?: string } })?.props;
+    const contextDeviceId = contextProps?.deviceId;
 
     let deviceId: string | undefined;
     let action: string | undefined;
@@ -79,6 +82,23 @@ const mcpApiHandler = {
         status: 400,
         headers: { "Content-Type": "application/json" },
       });
+    }
+
+    // The built-in demo reader answers in the Worker itself
+    // Only grants made with the demo code (marked with demoSession), and only
+    // while the demo is enabled
+    if (deviceId === DEMO_DEVICE_ID) {
+      if (!typedEnv.DEMO_PAIRING_CODE || !contextProps?.demoSession) {
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "The demo reader is not available" },
+          id: null,
+        }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return handleDemoMcp(request, contextProps.demoSession);
     }
 
     // Get the Durable Object for this device
@@ -242,6 +262,12 @@ export default {
             headers: { "Content-Type": "application/json" },
           });
         }
+        if (deviceId === DEMO_DEVICE_ID) {
+          return new Response(JSON.stringify({ error: "This device ID is reserved", code: "RESERVED_DEVICE_ID" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
 
         const doId = env.MCP_RELAY.idFromName(deviceId);
         const stub = env.MCP_RELAY.get(doId);
@@ -273,7 +299,7 @@ export default {
       const queryDeviceId = url.searchParams.get("device_id") || "";
       const deviceId = (headerDeviceId || queryDeviceId).trim().toLowerCase();
 
-      if (!deviceId) {
+      if (!deviceId || deviceId === DEMO_DEVICE_ID) {
         return new Response(JSON.stringify({ error: "deviceId is required" }), {
           status: 400,
           headers: { "Content-Type": "application/json" },
