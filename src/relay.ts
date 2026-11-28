@@ -115,10 +115,27 @@ interface QueuedRequest {
 }
 
 /**
- * Poll waiter - device waiting for a request
+ * Something the relay tells the device without expecting a response, such
+ * as an AI app finishing sign-in. Plugins that don't know a type ignore it.
+ */
+interface DeviceEvent {
+  event: string;
+  [key: string]: unknown;
+}
+
+/** Events wait for the next poll for at most this long */
+const EVENT_TTL_MS = 60_000;
+const MAX_QUEUED_EVENTS = 5;
+
+type PollMessage =
+  | { kind: "request"; request: QueuedRequest }
+  | { kind: "event"; event: DeviceEvent; createdAt: number };
+
+/**
+ * Poll waiter - device waiting for a request or event
  */
 interface PollWaiter {
-  resolve: (req: QueuedRequest | null) => void;
+  resolve: (message: PollMessage | null) => void;
   timeout: ReturnType<typeof setTimeout>;
 }
 
@@ -159,6 +176,7 @@ export class MCPRelay implements DurableObject {
   // Request handling
   private pendingRequests: Map<string, PendingRequest> = new Map();
   private requestQueue: QueuedRequest[] = [];
+  private eventQueue: { event: DeviceEvent; createdAt: number }[] = [];
   private pollWaiters: PollWaiter[] = [];
 
   // When true, devices that never registered a device secret are rejected
@@ -239,6 +257,11 @@ export class MCPRelay implements DurableObject {
       case "verify-passcode":
         return request.method === "POST"
           ? this.handleVerifyPasscode(request)
+          : this.methodNotAllowed();
+
+      case "notify":
+        return request.method === "POST"
+          ? this.handleNotify(request)
           : this.methodNotAllowed();
           
       default:
@@ -559,21 +582,20 @@ export class MCPRelay implements DurableObject {
     this.lastPollTime = Date.now();
     this.deviceInfo.lastActivity = Date.now();
 
-    // Immediate return if request is queued
-    if (this.requestQueue.length > 0) {
-      const queued = this.requestQueue.shift()!;
-      return this.jsonResponse({
-        type: "request",
-        requestId: queued.requestId,
-        method: queued.method,
-        path: queued.path,
-        headers: queued.headers,
-        body: queued.body,
-      });
+    // Immediate return if an event or request is queued
+    const now = Date.now();
+    this.eventQueue = this.eventQueue.filter(e => now - e.createdAt < EVENT_TTL_MS);
+    const queuedEvent = this.eventQueue.shift();
+    if (queuedEvent) {
+      return this.pollMessageResponse({ kind: "event", ...queuedEvent });
+    }
+    const queued = this.requestQueue.shift();
+    if (queued) {
+      return this.pollMessageResponse({ kind: "request", request: queued });
     }
 
-    // Long-poll: wait for a request
-    const result = await new Promise<QueuedRequest | null>((resolve) => {
+    // Long-poll: wait for a request or event
+    const result = await new Promise<PollMessage | null>((resolve) => {
       const timeout = setTimeout(() => {
         this.removeWaiter(resolve);
         resolve(null);
@@ -583,14 +605,7 @@ export class MCPRelay implements DurableObject {
     });
 
     if (result) {
-      return this.jsonResponse({
-        type: "request",
-        requestId: result.requestId,
-        method: result.method,
-        path: result.path,
-        headers: result.headers,
-        body: result.body,
-      });
+      return this.pollMessageResponse(result);
     }
 
     // Timeout - send ping
@@ -700,11 +715,7 @@ export class MCPRelay implements DurableObject {
     });
 
     // Deliver to waiting poll or queue
-    if (this.pollWaiters.length > 0) {
-      const waiter = this.pollWaiters.shift()!;
-      clearTimeout(waiter.timeout);
-      waiter.resolve(queuedRequest);
-    } else {
+    if (!this.deliverToWaiter({ kind: "request", request: queuedRequest })) {
       this.requestQueue.push(queuedRequest);
     }
 
@@ -734,6 +745,33 @@ export class MCPRelay implements DurableObject {
   }
 
   /**
+   * POST /notify (internal) - Pass an event to the device on its next poll.
+   * Not stored: an event for a device that isn't polling within
+   * EVENT_TTL_MS is dropped.
+   */
+  private async handleNotify(request: Request): Promise<Response> {
+    let event: DeviceEvent;
+    try {
+      event = await request.json();
+    } catch {
+      return this.jsonError("Invalid JSON", "PARSE_ERROR", 400);
+    }
+    if (!event || typeof event.event !== "string") {
+      return this.jsonError("event is required", "INVALID_EVENT", 400);
+    }
+    if (!this.deviceInfo) {
+      return this.jsonResponse({ delivered: false });
+    }
+    const createdAt = Date.now();
+    if (this.deliverToWaiter({ kind: "event", event, createdAt })) {
+      return this.jsonResponse({ delivered: true });
+    }
+    this.eventQueue.push({ event, createdAt });
+    if (this.eventQueue.length > MAX_QUEUED_EVENTS) this.eventQueue.shift();
+    return this.jsonResponse({ delivered: false, queued: true });
+  }
+
+  /**
    * GET /status - Check if device is online
    */
   private handleStatus(): Response {
@@ -756,7 +794,24 @@ export class MCPRelay implements DurableObject {
     return (Date.now() - this.lastPollTime) < SESSION_TIMEOUT;
   }
 
-  private removeWaiter(resolve: (req: QueuedRequest | null) => void): void {
+  /** Hand a message to a waiting poll; false if none is waiting */
+  private deliverToWaiter(message: PollMessage): boolean {
+    const waiter = this.pollWaiters.shift();
+    if (!waiter) return false;
+    clearTimeout(waiter.timeout);
+    waiter.resolve(message);
+    return true;
+  }
+
+  private pollMessageResponse(message: PollMessage): Response {
+    if (message.kind === "event") {
+      return this.jsonResponse({ type: "event", ...message.event });
+    }
+    const { requestId, method, path, headers, body } = message.request;
+    return this.jsonResponse({ type: "request", requestId, method, path, headers, body });
+  }
+
+  private removeWaiter(resolve: (message: PollMessage | null) => void): void {
     const idx = this.pollWaiters.findIndex(w => w.resolve === resolve);
     if (idx >= 0) this.pollWaiters.splice(idx, 1);
   }
