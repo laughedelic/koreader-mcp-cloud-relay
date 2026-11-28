@@ -154,10 +154,27 @@ interface QueuedRequest {
 }
 
 /**
- * Poll waiter - device waiting for a request
+ * Something the relay tells the device without expecting a response, such
+ * as an AI app finishing sign-in. Plugins that don't know a type ignore it.
+ */
+interface DeviceEvent {
+  event: string;
+  [key: string]: unknown;
+}
+
+/** Events wait for the next poll for at most this long */
+const EVENT_TTL_MS = 60_000;
+const MAX_QUEUED_EVENTS = 5;
+
+type PollMessage =
+  | { kind: "request"; request: QueuedRequest }
+  | { kind: "event"; event: DeviceEvent; createdAt: number };
+
+/**
+ * Poll waiter - device waiting for a request or event
  */
 interface PollWaiter {
-  resolve: (req: QueuedRequest | null) => void;
+  resolve: (message: PollMessage | null) => void;
   timeout: ReturnType<typeof setTimeout>;
 }
 
@@ -198,6 +215,7 @@ export class MCPRelay implements DurableObject {
   // Request handling
   private pendingRequests: Map<string, PendingRequest> = new Map();
   private requestQueue: QueuedRequest[] = [];
+  private eventQueue: { event: DeviceEvent; createdAt: number }[] = [];
   private pollWaiters: PollWaiter[] = [];
   // Requests handed to the device that it hasn't answered yet
   private inFlight: Set<string> = new Set();
@@ -336,6 +354,11 @@ export class MCPRelay implements DurableObject {
       case "verify-passcode":
         return request.method === "POST"
           ? this.handleVerifyPasscode(request)
+          : this.methodNotAllowed();
+
+      case "notify":
+        return request.method === "POST"
+          ? this.handleNotify(request)
           : this.methodNotAllowed();
           
       default:
@@ -666,56 +689,55 @@ export class MCPRelay implements DurableObject {
     this.deviceInfo.lastActivity = Date.now();
     this.touchContact();
 
-    // Immediate return if request is queued
-    let request: QueuedRequest | null = this.requestQueue.shift() || null;
-
-    if (!request) {
-      // Long-poll: wait for a request
-      let closedByDevice = false;
-      request = await new Promise<QueuedRequest | null>((resolve) => {
-        const timeout = setTimeout(() => {
-          this.removeWaiter(resolve);
-          resolve(null);
-        }, POLL_TIMEOUT);
-
-        this.pollWaiters.push({ resolve, timeout });
-
-        // The reader closed the connection (it went to sleep, or stopped
-        // the server): stop waiting, so no request is handed to a poll
-        // nobody reads. A reader that is still there polls again.
-        pollRequest.signal?.addEventListener("abort", () => {
-          closedByDevice = true;
-          clearTimeout(timeout);
-          this.removeWaiter(resolve);
-          resolve(null);
-        }, { once: true });
-      });
-      if (closedByDevice) {
-        // A request handed over just as the connection closed went nowhere
-        const lost = request && this.pendingRequests.get(request.requestId);
-        if (request && lost) {
-          clearTimeout(lost.timeout);
-          this.pendingRequests.delete(request.requestId);
-          lost.reject(new DeviceSilent(false));
-        }
-        return this.jsonResponse({ type: "ping" });
-      }
-      // The device is expected back within PICKUP_GRACE of this moment,
-      // unless this poll ended because the device said it is leaving
-      if (!this.left) this.touchContact();
+    // Immediate return if an event or request is queued
+    const now = Date.now();
+    this.eventQueue = this.eventQueue.filter(e => now - e.createdAt < EVENT_TTL_MS);
+    const queuedEvent = this.eventQueue.shift();
+    if (queuedEvent) {
+      return this.pollMessageResponse({ kind: "event", ...queuedEvent });
+    }
+    const queued = this.requestQueue.shift();
+    if (queued) {
+      return this.pollMessageResponse({ kind: "request", request: queued });
     }
 
-    if (request) {
-      // Only requests somebody still waits for count as being worked on
-      if (this.pendingRequests.has(request.requestId)) this.inFlight.add(request.requestId);
-      return this.jsonResponse({
-        type: "request",
-        requestId: request.requestId,
-        method: request.method,
-        path: request.path,
-        headers: request.headers,
-        body: request.body,
-      });
+    // Long-poll: wait for a request or event
+    let closedByDevice = false;
+    const result = await new Promise<PollMessage | null>((resolve) => {
+      const timeout = setTimeout(() => {
+        this.removeWaiter(resolve);
+        resolve(null);
+      }, POLL_TIMEOUT);
+
+      this.pollWaiters.push({ resolve, timeout });
+
+      // The reader closed the connection (it went to sleep, or stopped
+      // the server): stop waiting, so no request is handed to a poll
+      // nobody reads. A reader that is still there polls again.
+      pollRequest.signal?.addEventListener("abort", () => {
+        closedByDevice = true;
+        clearTimeout(timeout);
+        this.removeWaiter(resolve);
+        resolve(null);
+      }, { once: true });
+    });
+
+    if (closedByDevice) {
+      // A request handed over just as the connection closed went nowhere
+      const lost = result?.kind === "request" ? this.pendingRequests.get(result.request.requestId) : undefined;
+      if (result?.kind === "request" && lost) {
+        clearTimeout(lost.timeout);
+        this.pendingRequests.delete(result.request.requestId);
+        lost.reject(new DeviceSilent(false));
+      }
+      return this.jsonResponse({ type: "ping" });
+    }
+    // The device is expected back within PICKUP_GRACE of this moment,
+    // unless this poll ended because the device said it is leaving
+    if (!this.left) this.touchContact();
+
+    if (result) {
+      return this.pollMessageResponse(result);
     }
 
     // Timeout - send ping
@@ -852,11 +874,7 @@ export class MCPRelay implements DurableObject {
       this.pendingRequests.set(requestId, { resolve, reject, timeout, createdAt: Date.now() });
 
       // Deliver to waiting poll or queue
-      if (this.pollWaiters.length > 0) {
-        const waiter = this.pollWaiters.shift()!;
-        clearTimeout(waiter.timeout);
-        waiter.resolve(queuedRequest);
-      } else {
+      if (!this.deliverToWaiter({ kind: "request", request: queuedRequest })) {
         this.requestQueue.push(queuedRequest);
         pickupTimer = setTimeout(checkPickup, PICKUP_RECHECK);
       }
@@ -951,6 +969,33 @@ export class MCPRelay implements DurableObject {
       status: 503,
       headers: { "Content-Type": "application/octet-stream", [OFFLINE_FRAME_HEADER]: "1" },
     });
+  }
+
+  /**
+   * POST /notify (internal) - Pass an event to the device on its next poll.
+   * Not stored: an event for a device that isn't polling within
+   * EVENT_TTL_MS is dropped.
+   */
+  private async handleNotify(request: Request): Promise<Response> {
+    let event: DeviceEvent;
+    try {
+      event = await request.json();
+    } catch {
+      return this.jsonError("Invalid JSON", "PARSE_ERROR", 400);
+    }
+    if (!event || typeof event.event !== "string") {
+      return this.jsonError("event is required", "INVALID_EVENT", 400);
+    }
+    if (!this.deviceInfo) {
+      return this.jsonResponse({ delivered: false });
+    }
+    const createdAt = Date.now();
+    if (this.deliverToWaiter({ kind: "event", event, createdAt })) {
+      return this.jsonResponse({ delivered: true });
+    }
+    this.eventQueue.push({ event, createdAt });
+    if (this.eventQueue.length > MAX_QUEUED_EVENTS) this.eventQueue.shift();
+    return this.jsonResponse({ delivered: false, queued: true });
   }
 
   /**
@@ -1257,7 +1302,26 @@ export class MCPRelay implements DurableObject {
     }
   }
 
-  private removeWaiter(resolve: (req: QueuedRequest | null) => void): void {
+  /** Hand a message to a waiting poll; false if none is waiting */
+  private deliverToWaiter(message: PollMessage): boolean {
+    const waiter = this.pollWaiters.shift();
+    if (!waiter) return false;
+    clearTimeout(waiter.timeout);
+    waiter.resolve(message);
+    return true;
+  }
+
+  private pollMessageResponse(message: PollMessage): Response {
+    if (message.kind === "event") {
+      return this.jsonResponse({ type: "event", ...message.event });
+    }
+    const { requestId, method, path, headers, body } = message.request;
+    // Only requests somebody still waits for count as being worked on
+    if (this.pendingRequests.has(requestId)) this.inFlight.add(requestId);
+    return this.jsonResponse({ type: "request", requestId, method, path, headers, body });
+  }
+
+  private removeWaiter(resolve: (message: PollMessage | null) => void): void {
     const idx = this.pollWaiters.findIndex(w => w.resolve === resolve);
     if (idx >= 0) this.pollWaiters.splice(idx, 1);
   }

@@ -93,6 +93,8 @@ A code is single use, expires after 10 minutes, and a device has at most one liv
 
 Once a device has requested a pairing code, its permanent passcode stops working for new sign-ins. Older plugins keep using the device ID and passcode form (under "Older plugin?" on the sign-in page).
 
+When an AI app finishes sign-in, the relay tells the reader on its poll connection with `{"type": "event", "event": "app_connected", "name": "<app name>"}`, so the reader can close the pairing code and show who connected. Events aren't stored: one waits at most a minute for the next poll. Plugins that don't know a message type ignore it.
+
 ### 3. Making Authenticated MCP Requests
 
 Include the access token in the `Authorization` header:
