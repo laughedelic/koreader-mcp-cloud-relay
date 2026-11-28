@@ -10,6 +10,7 @@ import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provid
 import { Hono } from "hono";
 import type { Env } from "./types";
 import { DEMO_DEVICE_ID } from "./demo";
+import { generateAppKey, publicJwk, type AppKey } from "./memory-crypto";
 
 interface AuthEnv extends Env {
   OAUTH_PROVIDER: OAuthHelpers;
@@ -293,6 +294,27 @@ app.post("/authorize", async (c) => {
 
   const clientName = (clientInfo.clientName || "").slice(0, 80);
   try {
+    // Offline memory: each paired app gets a key pair. The private key goes
+    // into the grant's props (stored encrypted with the app's token); the
+    // device's object gets the public key, so snapshots are encrypted for
+    // this app from now on. See memory-crypto.ts.
+    let memoryKey: AppKey | undefined;
+    if (!demo) {
+      try {
+        memoryKey = await generateAppKey();
+        const stub = c.env.MCP_RELAY.get(c.env.MCP_RELAY.idFromName(deviceId));
+        await stub.fetch(new Request(`http://internal/${deviceId}/app-key`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: memoryKey.id, jwk: publicJwk(memoryKey.jwk) }),
+        }));
+      } catch (error) {
+        // Pairing must not fail over this: the object also learns the key
+        // from the app's first request
+        console.error("Offline memory: could not register an app key:", error);
+      }
+    }
+
     const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
       request: oauthReqInfo,
       userId: deviceId,
@@ -301,10 +323,12 @@ app.post("/authorize", async (c) => {
         deviceId,
         clientName,
         method: demo ? "demo" : pairingCode ? "pairing-code" : "passcode",
+        // Lets "disconnect" remove the app's public key too
+        ...(memoryKey ? { memoryKeyId: memoryKey.id } : {}),
       },
       scope: oauthReqInfo.scope,
       // demoSession marks demo grants and keeps each one's demo state apart
-      props: demo ? { deviceId, demoSession: crypto.randomUUID() } : { deviceId },
+      props: demo ? { deviceId, demoSession: crypto.randomUUID() } : { deviceId, ...(memoryKey ? { memoryKey } : {}) },
     });
     console.log(JSON.stringify({ event: "authorize", deviceId, method: demo ? "demo" : pairingCode ? "pairing-code" : "passcode", clientName }));
     return c.redirect(redirectTo, 302);
@@ -398,7 +422,33 @@ app.get("/connected-apps", async (c) => {
 app.delete("/connected-apps/:id", async (c) => {
   const auth = await authenticateDeviceRequest(c);
   if ("error" in auth) return auth.error;
-  await c.env.OAUTH_PROVIDER.revokeGrant(c.req.param("id"), auth.deviceId);
+  const grantId = c.req.param("id");
+
+  // Offline memory: find the app's key ID before the grant is gone
+  let memoryKeyId: string | undefined;
+  let cursor: string | undefined;
+  do {
+    const page = await c.env.OAUTH_PROVIDER.listUserGrants(auth.deviceId, { limit: 100, cursor });
+    const grant = page.items.find(item => item.id === grantId);
+    if (grant) {
+      if (typeof grant.metadata?.memoryKeyId === "string") memoryKeyId = grant.metadata.memoryKeyId;
+      break;
+    }
+    cursor = page.cursor;
+  } while (cursor);
+
+  // Revoking deletes the grant and its tokens, and with them the only copy
+  // of the app's private key: it can never open a snapshot again
+  await c.env.OAUTH_PROVIDER.revokeGrant(grantId, auth.deviceId);
+
+  if (memoryKeyId) {
+    const stub = c.env.MCP_RELAY.get(c.env.MCP_RELAY.idFromName(auth.deviceId));
+    await stub.fetch(new Request(`http://internal/${auth.deviceId}/app-key`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: memoryKeyId }),
+    }));
+  }
   return c.json({ ok: true });
 });
 
@@ -573,7 +623,8 @@ app.all("/:deviceId/*", async (c) => {
 
   // Internal-only endpoints are never reachable from outside, and the demo
   // reader has no device endpoints (nobody may register or poll as it)
-  if (action === "verify-passcode" || action === "device-auth" || deviceId.toLowerCase() === DEMO_DEVICE_ID) {
+  if (action === "verify-passcode" || action === "device-auth" || action === "app-key"
+      || deviceId.toLowerCase() === DEMO_DEVICE_ID) {
     return c.json({ error: { code: "NOT_FOUND", message: "Not Found" } }, 404);
   }
 
@@ -585,6 +636,8 @@ app.all("/:deviceId/*", async (c) => {
   // Add headers for DO; never pass through a client-supplied authentication marker
   const headers = new Headers(c.req.raw.headers);
   headers.delete("X-OAuth-Authenticated");
+  headers.delete("X-Memory-Key-Id");
+  headers.delete("X-Memory-Public-Key");
   headers.set("X-Relay-Base-URL", url.origin);
 
   return stub.fetch(new Request(url.toString(), {

@@ -10,6 +10,8 @@ A secure HTTP long-polling relay that enables remote access to KOReader MCP serv
 - **Cloudflare Durable Objects**: Persistent device state and request queuing
 - **Device-Based IDs**: IDs derived from your device model (e.g., `KoboClara-abc1`)
 - **Zero-Knowledge Passcode**: Passcode is generated and hashed on-device, never sent in plaintext
+- **Offline answers**: When the reader is asleep or away, AI apps get a clear "reader offline" answer instead of an error
+- **Offline memory (optional)**: The reader can save an encrypted copy of what is being read, so paired AI apps can still discuss it while the reader is offline
 
 ## How It Works
 
@@ -151,6 +153,61 @@ bun run wrangler secret put DEMO_PAIRING_CODE
 
 Signing in with that code connects the AI app to `demo-reader`, which the Worker answers itself with the plugin's tools, resources and prompts over a public-domain sample book (*Alice's Adventures in Wonderland*, chapters I to III). It exists so connector directory reviewers can try every tool without an e-reader. Page turns and highlights live only in the Worker's memory, separately for each sign-in. The demo code counts against the same wrong-guess limits as pairing codes, and removing the secret turns the demo off, including for apps already signed in. It speaks MCP 2025-03-26 to 2025-11-25. The tool definitions come from the plugin (`src/demo-data.json`); regenerate them when the plugin's tools change.
 
+## When the reader is offline
+
+An e-reader sleeps, turns WiFi off and stops its MCP server to save battery, so it is often away when an AI app calls. The relay then answers the MCP request itself instead of failing.
+
+A reader counts as reachable while it waits in a long poll, works on a request, or was heard from in the last 15 seconds. A request that arrives outside that window, or that nobody picks up, gets an offline answer:
+
+- `initialize`, `tools/list`, `prompts/list` and the resource lists still work, so the app keeps its tools. They use the tool list the plugin sent with its last `/register` (`manifest`), or the bundled definitions if it sent none.
+- Tool calls return a normal tool result that starts with `[Reader offline]`, says when the reader was last seen and tells the model how the user can bring it back. Tools that change something (`goto_page`, `annotate`) say that nothing was done.
+- Every result carries `structuredContent.reader` (`online: false`, `last_seen`, `source`).
+
+A reader that vanishes with its long poll open (WiFi dropped) can't be told apart from one that is slow, so the first request after that waits the full 30 second request timeout before it gets the offline answer (worded as "did not answer in time"). Later requests are answered at once. Two things shorten that wait when the reader leaves in an orderly way: a reader that sends `X-Reader-Leaving: 1` with its last `PUT /snapshot` is offline from that moment, and `wrangler.toml` sets the `enable_request_signal` compatibility flag so the relay can end a poll whose connection the reader closed. The second one is not reported by local `wrangler dev`, so it has not been tested there.
+
+Without offline memory this stores nothing about the book. The relay keeps the time it last heard from the reader and the plugin's tool list.
+
+### Offline memory
+
+Offline memory is optional and off unless the user turns it on in the plugin. The reader then sends a snapshot of the open book with `PUT /snapshot`, and while the reader is offline the relay answers the read-only tools (`get_reading_context`, `get_book_metadata`, `read_pages`, `search_book`) and the `book://` resources from it. Each answer starts with `[Reader offline: answering from a saved copy]`, says when the copy was saved and which pages it holds, and never pretends to cover the rest of the book. As soon as the reader is back, requests go to the reader again and the saved copy is not used.
+
+There is one snapshot per device (the book that was open last). A new one replaces the old one.
+
+**Snapshot format** (JSON, UTF-8, at most `SNAPSHOT_MAX_BYTES`):
+
+```jsonc
+{
+  "v": 1,
+  "taken_at": 1796000000,          // Unix seconds, on the reader
+  "scope": "pages",                // label chosen by the plugin, e.g. "position" or "pages"
+  "retention_days": 30,            // capped by SNAPSHOT_MAX_RETENTION_DAYS
+  "book": { "title": "", "authors": "", "language": "", "series": "", "keywords": "",
+            "description": "", "format": "epub", "total_pages": 300 },
+  "position": { "page": 118, "percent_finished": 0.39,
+                "chapter": { "name": "", "index": 7, "start_page": 110, "end_page": 131 } },
+  "toc": [{ "index": 1, "title": "", "page": 1, "depth": 1 }],
+  "annotations": [{ "text": "", "note": "", "note_format": "", "page": 40, "chapter": "",
+                    "datetime": "2026-11-20 10:00:00", "color": "", "style": "" }],
+  "pages": [{ "number": 118, "text": "" }]   // may be empty
+}
+```
+
+A reader that is about to sleep or stop adds the header `X-Reader-Leaving: 1` to its last snapshot.
+
+`PUT /snapshot` answers `{stored: true, apps, bytes, expiresAt}`, or `{stored: false, reason: "NO_PAIRED_APPS"}` when no paired app could read it (nothing is kept then). Errors: `413 SNAPSHOT_TOO_LARGE`, `429 TOO_MANY_SNAPSHOTS` (at most one every 15 seconds, with `Retry-After`), `400 UNSUPPORTED_SNAPSHOT`, `403 OFFLINE_MEMORY_DISABLED`. `/register` reports `offlineMemory: {maxBytes, maxRetentionDays}` when the relay offers it.
+
+**Encryption.** The relay can't read a stored snapshot on its own:
+
+- Every paired AI app (OAuth grant) gets an ECDH P-256 key pair when it pairs. The private key lives only in the grant's `props`, which the OAuth provider encrypts with the app's token as key material. The device's Durable Object only ever holds the public key.
+- A snapshot is encrypted with a fresh AES-256-GCM key as soon as it arrives. That key is wrapped for each paired app's public key (ephemeral ECDH, HKDF-SHA256, AES-GCM) and then dropped. Only the ciphertext is stored.
+- When a paired app calls with a valid token while the reader is offline, the Worker takes the private key from the decrypted grant, unwraps the content key and reads the snapshot for that one request.
+
+So reading a snapshot takes a live token of an app the user paired. A copy of the storage alone is not enough, and neither is the device ID. The plaintext passes through the Worker's memory when it is saved and when a paired app reads it, so this protects data at rest, not against a relay operator who changes the code.
+
+An app paired before this feature existed gets its key at its next token refresh. An app paired after a snapshot was saved can't read that one ("locked"), only the next. Disconnecting an app deletes its grant, its key and its wrapped copy of the snapshot key.
+
+**Deletion.** A snapshot is deleted when it expires (a Durable Object alarm, at most `SNAPSHOT_MAX_RETENTION_DAYS` after it was saved), when the reader sends `DELETE /snapshot`, when the last app that could read it is disconnected, or when a newer one replaces it.
+
 ## API Endpoints
 
 ### `GET /`
@@ -178,10 +235,13 @@ Returns relay info and available endpoints.
 | `/pairing-code` | POST | Get a one-time pairing code (`{code, expiresAt, expiresIn, relayUrl}`) |
 | `/connected-apps` | GET | List authorized AI apps (`{apps: [{id, name, connectedAt}]}`, `connectedAt` in Unix seconds) |
 | `/connected-apps/{id}` | DELETE | Disconnect an AI app (revokes its grant and tokens) |
+| `/snapshot` | PUT | Save a snapshot of what is being read (see [Offline memory](#offline-memory)) |
+| `/snapshot` | GET | What is saved (`{stored, receivedAt, expiresAt, bytes, scope, apps}`), never the content |
+| `/snapshot` | DELETE | Delete the saved snapshot |
 
 All device endpoints require the `X-Device-Id` header (except `/register`, which includes `deviceId` in the JSON body).
 
-`/poll`, `/response`, `/pong`, `/status`, `/pairing-code` and `/connected-apps` also require `Authorization: Device <deviceSecret>`, using the secret the device sent at registration. Re-registering a device that has a secret requires the same secret. `/status`, `/pairing-code` and `/connected-apps` always require the secret.
+`/poll`, `/response`, `/pong`, `/status`, `/pairing-code`, `/connected-apps` and `/snapshot` also require `Authorization: Device <deviceSecret>`, using the secret the device sent at registration. Re-registering a device that has a secret requires the same secret. `/status`, `/pairing-code`, `/connected-apps` and `/snapshot` always require the secret.
 
 While `REQUIRE_DEVICE_SECRET` is `"false"` (the default, for compatibility), any registration without `deviceSecret` is accepted, new or old, and that device's `/poll`, `/response` and `/pong` calls are not authenticated. Such a device upgrades by re-registering with a secret and its passcode hash. Set `REQUIRE_DEVICE_SECRET = "true"` in `wrangler.toml` to reject secretless registrations and unauthenticated device calls.
 
@@ -215,6 +275,13 @@ Only protocol headers (`Accept`, `Content-Type`, `MCP-Protocol-Version`, `Mcp-Me
 - **Device secret**: A random secret generated on the device authenticates its polling, so knowing a device ID is not enough to receive its requests
 - **Header allowlist**: Client credentials are never forwarded to the device
 
+### Offline Memory Security
+
+- **Opt-in**: nothing from the book is stored unless the user turns offline memory on in the plugin
+- **Encrypted for paired apps**: a stored snapshot can only be opened with a paired app's live token (see [Offline memory](#offline-memory))
+- **Written only by the device**: saving, inspecting and deleting a snapshot require the device secret
+- **Bounded**: one snapshot per device, capped in size, deleted after its retention time
+
 ### Token Security
 
 - **Short-lived tokens**: Access tokens expire in 1 hour
@@ -242,10 +309,28 @@ Following [MCP Security Best Practices](https://modelcontextprotocol.io/specific
 | Device ID format | `{model}-xxxx` | Device model + 4-char random suffix              |
 | Passcode format  | 6 digits       | Random numeric passcode                          |
 
+Settings in `wrangler.toml` (`[vars]`):
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `REQUIRE_DEVICE_SECRET` | `"false"` | Reject devices that register without a device secret |
+| `SNAPSHOT_MAX_BYTES` | `"262144"` | Largest snapshot the relay accepts (256 KB keeps an offline answer well inside the free plan's 10 ms of CPU time). `"0"` turns offline memory off |
+| `SNAPSHOT_MAX_RETENTION_DAYS` | `"30"` | Longest time a snapshot is kept |
+
+## Testing
+
+`test/e2e.mjs` plays a reader and two AI apps against a local relay: pairing, live requests, snapshots, offline answers for every tool, a second app, token refresh, disconnecting an app, forgetting the saved copy and the size limits. It needs Node 20 or newer and takes about a minute.
+
+```bash
+bun run dev          # in one terminal
+bun run test:e2e     # in another
+```
+
 ## Cost Estimation (Cloudflare Free Tier)
 
 | Resource                | Free Tier Limit | Expected Usage |
 | ----------------------- | --------------- | -------------- |
 | Worker Requests         | 100,000/day     | ~1,000/day     |
 | Durable Object Requests | 1,000,000/month | ~10,000/month  |
-| Durable Object Storage  | 1 GB            | ~1 MB          |
+| Durable Object Storage  | 5 GB            | ~1 MB, plus up to 256 KB per device that uses offline memory |
+| Durable Object rows written | 100,000/day | 1 per saved snapshot (at most 4 a minute per device) |

@@ -6,12 +6,34 @@ import {
   RequestMessage,
   StatusResponse,
   OAuthError,
+  Manifest,
+  OfflineInfo,
+  StoredAppKey,
+  StoredSnapshot,
 } from "./types";
+import { APP_KEY_ID_PATTERN, parsePublicJwk, sealSnapshot } from "./memory-crypto";
+import { OFFLINE_FRAME_HEADER, encodeOfflineFrame } from "./offline-frame";
 
 // Timeouts in milliseconds
 const REQUEST_TIMEOUT = 30000;  // 30 seconds - how long client waits for device response
 const POLL_TIMEOUT = 30000;     // 30 seconds - how long device poll blocks
-const SESSION_TIMEOUT = 120000; // 2 minutes - device considered offline after this
+const SESSION_TIMEOUT = 120000; // 2 minutes - device reported offline by /status after this
+// How long a device may stay silent between polls before a waiting request is
+// answered as "reader offline". A live device polls again within a few
+// seconds of its last contact (its longest gap between polls is 5 seconds).
+const PICKUP_GRACE = 15000;
+const PICKUP_RECHECK = 2000;    // how often a queued request rechecks for signs of life
+const LAST_SEEN_WRITE_INTERVAL = 600_000; // persist "last seen" at most every 10 minutes
+
+// Offline memory
+const DEFAULT_SNAPSHOT_MAX_BYTES = 262144; // 256 KB: keeps an offline answer well inside the free plan's CPU time
+const DEFAULT_SNAPSHOT_MAX_RETENTION_DAYS = 30;
+const MIN_SNAPSHOT_INTERVAL = 15000;      // a device may store a snapshot at most this often
+const MAX_APP_KEYS = 20;                  // paired apps that can read a device's snapshots
+const APP_KEY_IDLE_LIMIT = 90 * 86_400_000; // forget an app's public key after 90 days unused
+const APP_KEY_TOUCH_INTERVAL = 86_400_000;  // persist an app key's last use at most daily
+const MAX_MANIFEST_BYTES = 65536;
+const DAY_MS = 86_400_000;
 
 // Passcode brute-force protection
 const MAX_FREE_PASSCODE_ATTEMPTS = 5;      // failures allowed before lockout kicks in
@@ -102,6 +124,23 @@ async function verifyPasscode(passcode: string, storedHash: string): Promise<boo
   return timingSafeEqual(computedHash, storedHash);
 }
 
+/** Parse a non-negative integer setting, or use the default */
+function nonNegativeInt(value: string | undefined, fallback: number): number {
+  if (value === undefined || value === "") return fallback;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 ? n : fallback;
+}
+
+/** Thrown inside handleMCPRequest when the device turns out to be away */
+class DeviceSilent extends Error {
+  /** True if the device took the request but never answered it */
+  unresponsive: boolean;
+  constructor(unresponsive: boolean) {
+    super("Device is offline");
+    this.unresponsive = unresponsive;
+  }
+}
+
 /**
  * Queued request waiting for device to poll
  */
@@ -160,6 +199,23 @@ export class MCPRelay implements DurableObject {
   private pendingRequests: Map<string, PendingRequest> = new Map();
   private requestQueue: QueuedRequest[] = [];
   private pollWaiters: PollWaiter[] = [];
+  // Requests handed to the device that it hasn't answered yet
+  private inFlight: Set<string> = new Set();
+  // Last sign of life from the device (poll, response or pong), in memory
+  private lastContact: number = 0;
+  /** True after the device announced it is going away, until it is heard from again */
+  private left = false;
+  // The same, as last written to storage (survives eviction)
+  private lastSeen: number = 0;
+  // After a restart of this object, a device seen shortly before gets a
+  // moment to poll again before requests are answered as offline
+  private startupGraceUntil: number = 0;
+
+  // Offline memory
+  private appKeys: Record<string, StoredAppKey> = {};
+  private lastSnapshotAt: number = 0;
+  private snapshotMaxBytes: number;
+  private snapshotMaxRetentionDays: number;
 
   // When true, devices that never registered a device secret are rejected
   // on /poll, /response and /pong (set REQUIRE_DEVICE_SECRET="true" once
@@ -168,10 +224,24 @@ export class MCPRelay implements DurableObject {
 
   constructor(state: DurableObjectState, env: unknown) {
     this.state = state;
-    this.requireDeviceSecret = (env as { REQUIRE_DEVICE_SECRET?: string })?.REQUIRE_DEVICE_SECRET === "true";
+    const vars = (env || {}) as {
+      REQUIRE_DEVICE_SECRET?: string;
+      SNAPSHOT_MAX_BYTES?: string;
+      SNAPSHOT_MAX_RETENTION_DAYS?: string;
+    };
+    this.requireDeviceSecret = vars.REQUIRE_DEVICE_SECRET === "true";
+    this.snapshotMaxBytes = nonNegativeInt(vars.SNAPSHOT_MAX_BYTES, DEFAULT_SNAPSHOT_MAX_BYTES);
+    this.snapshotMaxRetentionDays =
+      Math.max(1, nonNegativeInt(vars.SNAPSHOT_MAX_RETENTION_DAYS, DEFAULT_SNAPSHOT_MAX_RETENTION_DAYS));
     // Restore device info from storage
     this.state.blockConcurrencyWhile(async () => {
-      this.deviceInfo = await this.state.storage.get("deviceInfo") || null;
+      const stored = await this.state.storage.get<unknown>(["deviceInfo", "lastSeen", "appKeys"]);
+      this.deviceInfo = (stored.get("deviceInfo") as DeviceInfo | undefined) || null;
+      this.lastSeen = (stored.get("lastSeen") as number | undefined) || 0;
+      this.appKeys = (stored.get("appKeys") as Record<string, StoredAppKey> | undefined) || {};
+      if (Date.now() - this.lastSeen < LAST_SEEN_WRITE_INTERVAL + 60_000) {
+        this.startupGraceUntil = Date.now() + PICKUP_GRACE;
+      }
     });
   }
 
@@ -191,8 +261,8 @@ export class MCPRelay implements DurableObject {
     }
 
     // Device-only endpoints require the device secret (see authenticateDevice)
-    if (["poll", "response", "pong", "status"].includes(action)) {
-      const authError = await this.authenticateDevice(request, action === "status");
+    if (["poll", "response", "pong", "status", "snapshot"].includes(action)) {
+      const authError = await this.authenticateDevice(request, action === "status" || action === "snapshot");
       if (authError) return authError;
     }
 
@@ -205,7 +275,7 @@ export class MCPRelay implements DurableObject {
 
       case "poll":
         return request.method === "GET"
-          ? this.handlePoll()
+          ? this.handlePoll(request)
           : this.methodNotAllowed();
 
       case "response":
@@ -230,7 +300,24 @@ export class MCPRelay implements DurableObject {
           ? this.handleStatus()
           : this.methodNotAllowed();
 
+      case "snapshot":
+        if (request.method === "PUT") {
+          const response = await this.handleSnapshotPut(request);
+          // The reader says this is its last word before it sleeps or stops
+          // (whether or not the snapshot itself was accepted)
+          if (request.headers.get("X-Reader-Leaving") === "1") await this.markLeft();
+          return response;
+        }
+        if (request.method === "GET") return this.handleSnapshotGet();
+        if (request.method === "DELETE") return this.handleSnapshotDelete();
+        return this.methodNotAllowed("GET, PUT, DELETE");
+
       // Internal endpoints (reached only from the Worker, never routed from outside)
+      case "app-key":
+        if (request.method === "POST") return this.handleAppKeyAdd(request);
+        if (request.method === "DELETE") return this.handleAppKeyRemove(request);
+        return this.methodNotAllowed();
+
       case "device-auth":
         return request.method === "POST"
           ? this.handleDeviceAuth(request)
@@ -364,6 +451,8 @@ export class MCPRelay implements DurableObject {
     this.lastPollTime = Date.now();
 
     await this.state.storage.put("deviceInfo", this.deviceInfo);
+    this.touchContact();
+    await this.storeManifest(body.manifest);
 
     // One structured line per registration, so Workers Logs can count devices
     // that still connect without a secret (see README: REQUIRE_DEVICE_SECRET)
@@ -387,6 +476,13 @@ export class MCPRelay implements DurableObject {
     response.deviceSecretRegistered = !!deviceSecretHash;
     // Tells the plugin it can offer "Connect an AI app" (one-time codes)
     response.pairingCodesSupported = true;
+    // Tells the plugin it can offer offline memory, and within which limits
+    if (this.snapshotMaxBytes > 0) {
+      response.offlineMemory = {
+        maxBytes: this.snapshotMaxBytes,
+        maxRetentionDays: this.snapshotMaxRetentionDays,
+      };
+    }
     if (!isReconnection) {
       response.message = "Device registered successfully. Use the passcode you generated to authenticate MCP clients.";
     }
@@ -550,7 +646,7 @@ export class MCPRelay implements DurableObject {
   /**
    * GET /poll - Device long-polls for requests
    */
-  private async handlePoll(): Promise<Response> {
+  private async handlePoll(pollRequest: Request): Promise<Response> {
     if (!this.deviceInfo) {
       return this.jsonError("Not registered", "NOT_REGISTERED", 410);
     }
@@ -558,38 +654,57 @@ export class MCPRelay implements DurableObject {
     // Update activity timestamps
     this.lastPollTime = Date.now();
     this.deviceInfo.lastActivity = Date.now();
+    this.touchContact();
 
     // Immediate return if request is queued
-    if (this.requestQueue.length > 0) {
-      const queued = this.requestQueue.shift()!;
-      return this.jsonResponse({
-        type: "request",
-        requestId: queued.requestId,
-        method: queued.method,
-        path: queued.path,
-        headers: queued.headers,
-        body: queued.body,
+    let request: QueuedRequest | null = this.requestQueue.shift() || null;
+
+    if (!request) {
+      // Long-poll: wait for a request
+      let closedByDevice = false;
+      request = await new Promise<QueuedRequest | null>((resolve) => {
+        const timeout = setTimeout(() => {
+          this.removeWaiter(resolve);
+          resolve(null);
+        }, POLL_TIMEOUT);
+
+        this.pollWaiters.push({ resolve, timeout });
+
+        // The reader closed the connection (it went to sleep, or stopped
+        // the server): stop waiting, so no request is handed to a poll
+        // nobody reads. A reader that is still there polls again.
+        pollRequest.signal?.addEventListener("abort", () => {
+          closedByDevice = true;
+          clearTimeout(timeout);
+          this.removeWaiter(resolve);
+          resolve(null);
+        }, { once: true });
       });
+      if (closedByDevice) {
+        // A request handed over just as the connection closed went nowhere
+        const lost = request && this.pendingRequests.get(request.requestId);
+        if (request && lost) {
+          clearTimeout(lost.timeout);
+          this.pendingRequests.delete(request.requestId);
+          lost.reject(new DeviceSilent(false));
+        }
+        return this.jsonResponse({ type: "ping" });
+      }
+      // The device is expected back within PICKUP_GRACE of this moment,
+      // unless this poll ended because the device said it is leaving
+      if (!this.left) this.touchContact();
     }
 
-    // Long-poll: wait for a request
-    const result = await new Promise<QueuedRequest | null>((resolve) => {
-      const timeout = setTimeout(() => {
-        this.removeWaiter(resolve);
-        resolve(null);
-      }, POLL_TIMEOUT);
-
-      this.pollWaiters.push({ resolve, timeout });
-    });
-
-    if (result) {
+    if (request) {
+      // Only requests somebody still waits for count as being worked on
+      if (this.pendingRequests.has(request.requestId)) this.inFlight.add(request.requestId);
       return this.jsonResponse({
         type: "request",
-        requestId: result.requestId,
-        method: result.method,
-        path: result.path,
-        headers: result.headers,
-        body: result.body,
+        requestId: request.requestId,
+        method: request.method,
+        path: request.path,
+        headers: request.headers,
+        body: request.body,
       });
     }
 
@@ -613,6 +728,9 @@ export class MCPRelay implements DurableObject {
     // admitted before that must not resolve a request
     const authError = await this.authenticateDevice(request);
     if (authError) return authError;
+
+    this.touchContact();
+    this.inFlight.delete(body.requestId);
 
     const pending = this.pendingRequests.get(body.requestId);
     if (!pending) {
@@ -639,6 +757,7 @@ export class MCPRelay implements DurableObject {
     if (this.deviceInfo) {
       this.deviceInfo.lastActivity = Date.now();
     }
+    this.touchContact();
     return this.jsonResponse({ success: true });
   }
 
@@ -651,6 +770,9 @@ export class MCPRelay implements DurableObject {
    * 
    * Authentication is handled by the OAuthProvider in index.ts.
    * Requests that reach this handler are already authenticated.
+   *
+   * When the device can't answer, the Worker gets an offline frame instead
+   * (see offlineResponse) and answers the client itself.
    */
   private async handleMCPRequest(request: Request): Promise<Response> {
     // Check if this request was pre-authenticated by the OAuthProvider
@@ -665,12 +787,12 @@ export class MCPRelay implements DurableObject {
       );
     }
 
-    if (!this.isDeviceOnline()) {
-      return this.jsonResponse({
-        jsonrpc: "2.0",
-        error: { code: -32000, message: "Device is offline" },
-        id: null,
-      }, 503);
+    // The calling app's key for offline memory (set by the Worker from the
+    // app's grant; never taken from an unauthenticated request)
+    const appKeyId = oauthAuthenticated ? await this.noteAppKey(request) : null;
+
+    if (!this.deviceReachable()) {
+      return this.offlineResponse(oauthAuthenticated, appKeyId, false);
     }
 
     const body = await request.text();
@@ -686,27 +808,49 @@ export class MCPRelay implements DurableObject {
       createdAt: Date.now(),
     };
 
-    // Set up response promise
+    // Set up response promise. It rejects with DeviceSilent when the device
+    // turns out to be away, and with a plain Error on other failures.
+    let pickupTimer: ReturnType<typeof setTimeout> | undefined;
     const responsePromise = new Promise<ResponseMessage>((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      const giveUp = (reason: Error) => {
         this.pendingRequests.delete(requestId);
+        this.inFlight.delete(requestId);
         // Drop it from the queue too, so a reader that reconnects later
         // doesn't receive a request nobody is waiting for
         this.requestQueue = this.requestQueue.filter(q => q.requestId !== requestId);
-        reject(new Error("Request timeout"));
+        reject(reason);
+      };
+
+      const timeout = setTimeout(() => {
+        // Handed to the device but never answered: it most likely went to
+        // sleep with the connection open. Still queued: it never came back.
+        giveUp(new DeviceSilent(this.inFlight.has(requestId)));
       }, REQUEST_TIMEOUT);
 
-      this.pendingRequests.set(requestId, { resolve, reject, timeout, createdAt: Date.now() });
-    });
+      // A request nobody picks up is answered as offline well before the
+      // full timeout, unless the device shows signs of life
+      const checkPickup = () => {
+        if (!this.requestQueue.some(q => q.requestId === requestId)) return;
+        if (this.deviceReachable()) {
+          pickupTimer = setTimeout(checkPickup, PICKUP_RECHECK);
+          return;
+        }
+        clearTimeout(timeout);
+        giveUp(new DeviceSilent(false));
+      };
 
-    // Deliver to waiting poll or queue
-    if (this.pollWaiters.length > 0) {
-      const waiter = this.pollWaiters.shift()!;
-      clearTimeout(waiter.timeout);
-      waiter.resolve(queuedRequest);
-    } else {
-      this.requestQueue.push(queuedRequest);
-    }
+      this.pendingRequests.set(requestId, { resolve, reject, timeout, createdAt: Date.now() });
+
+      // Deliver to waiting poll or queue
+      if (this.pollWaiters.length > 0) {
+        const waiter = this.pollWaiters.shift()!;
+        clearTimeout(waiter.timeout);
+        waiter.resolve(queuedRequest);
+      } else {
+        this.requestQueue.push(queuedRequest);
+        pickupTimer = setTimeout(checkPickup, PICKUP_RECHECK);
+      }
+    });
 
     // Wait for response
     try {
@@ -724,13 +868,79 @@ export class MCPRelay implements DurableObject {
         headers,
       }));
     } catch (error) {
+      if (error instanceof DeviceSilent) {
+        return this.offlineResponse(oauthAuthenticated, appKeyId, error.unresponsive);
+      }
       const message = error instanceof Error ? error.message : "Unknown error";
       return this.jsonResponse({
         jsonrpc: "2.0",
         error: { code: -32000, message: `Relay error: ${message}` },
         id: null,
       }, 504);
+    } finally {
+      if (pickupTimer !== undefined) clearTimeout(pickupTimer);
     }
+  }
+
+  /**
+   * Answer for a request the device can't serve right now.
+   *
+   * The Worker (the only caller that is OAuth-authenticated) gets an offline
+   * frame: what is known about the device, plus the stored snapshot's
+   * ciphertext if the calling app has a key for it. The Worker decrypts it
+   * with the app's private key and answers the MCP request itself. This
+   * object never sees that key or the snapshot's plaintext at this point.
+   */
+  private async offlineResponse(
+    forWorker: boolean, appKeyId: string | null, unresponsive: boolean,
+  ): Promise<Response> {
+    if (!forWorker) {
+      return this.jsonResponse({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Device is offline" },
+        id: null,
+      }, 503);
+    }
+
+    // Keep "last seen" across eviction, now that the device is known to be away
+    if (this.lastContact > this.lastSeen) {
+      this.lastSeen = this.lastContact;
+      await this.state.storage.put("lastSeen", this.lastSeen);
+    }
+
+    const info: OfflineInfo = {
+      lastSeen: Math.max(this.lastSeen, this.lastContact) || null,
+      unresponsive,
+      deviceName: this.deviceInfo?.deviceName,
+      manifest: (await this.state.storage.get<Manifest>("manifest")) || null,
+      memory: "none",
+    };
+
+    let ciphertext: ArrayBuffer | undefined;
+    const snapshot = await this.loadSnapshot();
+    if (snapshot) {
+      const wrap = appKeyId ? snapshot.wraps[appKeyId] : undefined;
+      if (wrap) {
+        info.memory = "sealed";
+        info.snapshot = {
+          receivedAt: snapshot.receivedAt,
+          expiresAt: snapshot.expiresAt,
+          bytes: snapshot.bytes,
+          scope: snapshot.scope,
+          eph: snapshot.eph,
+          iv: snapshot.iv,
+          wrap,
+        };
+        ciphertext = snapshot.ct;
+      } else {
+        info.memory = "locked";
+      }
+    }
+
+    return new Response(encodeOfflineFrame(info, ciphertext), {
+      status: 503,
+      headers: { "Content-Type": "application/octet-stream", [OFFLINE_FRAME_HEADER]: "1" },
+    });
   }
 
   /**
@@ -748,12 +958,293 @@ export class MCPRelay implements DurableObject {
   }
 
   // ============================================
+  // Offline memory (device endpoints)
+  // ============================================
+
+  /**
+   * PUT /snapshot - Device stores a snapshot of what is being read
+   *
+   * The body is the snapshot JSON (see README: Offline memory). It is
+   * encrypted for the device's paired apps before it is stored; the relay
+   * keeps no readable copy.
+   */
+  private async handleSnapshotPut(request: Request): Promise<Response> {
+    if (!this.deviceInfo) {
+      return this.jsonError("Not registered", "NOT_REGISTERED", 410);
+    }
+    if (this.snapshotMaxBytes <= 0) {
+      return this.jsonError("Offline memory is turned off on this relay", "OFFLINE_MEMORY_DISABLED", 403);
+    }
+    const tooLarge = () => this.jsonError(
+      `Snapshot is larger than ${this.snapshotMaxBytes} bytes`, "SNAPSHOT_TOO_LARGE", 413);
+    if (Number(request.headers.get("Content-Length") || 0) > this.snapshotMaxBytes) return tooLarge();
+
+    const now = Date.now();
+    if (now - this.lastSnapshotAt < MIN_SNAPSHOT_INTERVAL) {
+      const response = this.jsonError("Snapshots are being sent too often", "TOO_MANY_SNAPSHOTS", 429);
+      response.headers.set("Retry-After", String(Math.ceil((MIN_SNAPSHOT_INTERVAL - (now - this.lastSnapshotAt)) / 1000)));
+      return response;
+    }
+
+    const plaintext = await request.arrayBuffer();
+    if (plaintext.byteLength > this.snapshotMaxBytes) return tooLarge();
+
+    // Only the shape is checked here; the content is read again (and
+    // validated) when an app asks for it
+    let parsed: { v?: unknown; scope?: unknown; retention_days?: unknown };
+    try {
+      parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(plaintext));
+    } catch {
+      return this.jsonError("Snapshot must be UTF-8 JSON", "PARSE_ERROR", 400);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.v !== 1) {
+      return this.jsonError("Unsupported snapshot format", "UNSUPPORTED_SNAPSHOT", 400);
+    }
+
+    this.lastSnapshotAt = now;
+    await this.pruneAppKeys(now);
+    const recipients: Record<string, JsonWebKey> = {};
+    for (const [id, key] of Object.entries(this.appKeys)) recipients[id] = key.jwk;
+
+    // With no paired app there is nobody who could ever read it
+    if (Object.keys(recipients).length === 0) {
+      await this.state.storage.delete("snapshot");
+      return this.jsonResponse({ stored: false, reason: "NO_PAIRED_APPS", apps: 0 });
+    }
+
+    const requestedDays = typeof parsed.retention_days === "number" && parsed.retention_days > 0
+      ? parsed.retention_days : this.snapshotMaxRetentionDays;
+    const retentionDays = Math.min(requestedDays, this.snapshotMaxRetentionDays);
+    const sealed = await sealSnapshot(plaintext, recipients);
+    const snapshot: StoredSnapshot = {
+      receivedAt: now,
+      expiresAt: now + Math.round(retentionDays * DAY_MS),
+      bytes: plaintext.byteLength,
+      scope: typeof parsed.scope === "string" ? parsed.scope.slice(0, 32) : undefined,
+      ...sealed,
+    };
+    await this.state.storage.put("snapshot", snapshot);
+
+    // Expiry: one alarm, set when there is none or it would fire too late
+    const alarm = await this.state.storage.getAlarm();
+    if (alarm === null || alarm > snapshot.expiresAt) {
+      await this.state.storage.setAlarm(snapshot.expiresAt);
+    }
+
+    return this.jsonResponse({
+      stored: true,
+      apps: Object.keys(sealed.wraps).length,
+      bytes: snapshot.bytes,
+      expiresAt: snapshot.expiresAt,
+    });
+  }
+
+  /** GET /snapshot - Device asks what is stored (never the content) */
+  private async handleSnapshotGet(): Promise<Response> {
+    const snapshot = await this.loadSnapshot();
+    if (!snapshot) return this.jsonResponse({ stored: false });
+    return this.jsonResponse({
+      stored: true,
+      receivedAt: snapshot.receivedAt,
+      expiresAt: snapshot.expiresAt,
+      bytes: snapshot.bytes,
+      scope: snapshot.scope,
+      apps: Object.keys(snapshot.wraps).length,
+    });
+  }
+
+  /** DELETE /snapshot - Device removes its stored snapshot */
+  private async handleSnapshotDelete(): Promise<Response> {
+    const existed = await this.state.storage.delete("snapshot");
+    return this.jsonResponse({ ok: true, deleted: existed });
+  }
+
+  /** Alarm: delete the snapshot once it has expired */
+  async alarm(): Promise<void> {
+    await this.loadSnapshot();
+  }
+
+  /** The stored snapshot, unless it has expired (then it is deleted) */
+  private async loadSnapshot(): Promise<StoredSnapshot | null> {
+    const snapshot = await this.state.storage.get<StoredSnapshot>("snapshot");
+    if (!snapshot) return null;
+    if (Date.now() >= snapshot.expiresAt) {
+      await this.state.storage.delete("snapshot");
+      return null;
+    }
+    // Make sure something deletes it even if nobody asks again
+    if ((await this.state.storage.getAlarm()) === null) {
+      await this.state.storage.setAlarm(snapshot.expiresAt);
+    }
+    return snapshot;
+  }
+
+  // ============================================
+  // Offline memory (paired apps' public keys)
+  // ============================================
+
+  /**
+   * Remember the calling app's public key, so the next snapshot is also
+   * encrypted for it. The Worker sends it with every authenticated request.
+   * @returns the app's key ID, or null if the request carries none
+   */
+  private async noteAppKey(request: Request): Promise<string | null> {
+    const id = request.headers.get("X-Memory-Key-Id") || "";
+    if (!APP_KEY_ID_PATTERN.test(id)) return null;
+    const now = Date.now();
+    const known = this.appKeys[id];
+    if (known) {
+      if (now - known.lastUsed > APP_KEY_TOUCH_INTERVAL) {
+        known.lastUsed = now;
+        await this.state.storage.put("appKeys", this.appKeys);
+      }
+      return id;
+    }
+    let jwk: JsonWebKey | null = null;
+    try {
+      jwk = parsePublicJwk(JSON.parse(request.headers.get("X-Memory-Public-Key") || "null"));
+    } catch {
+      // not JSON: treated as no key
+    }
+    if (!jwk) return null;
+    await this.addAppKey(id, jwk, now);
+    return id;
+  }
+
+  private async addAppKey(id: string, jwk: JsonWebKey, now: number): Promise<void> {
+    this.appKeys[id] = { jwk, addedAt: this.appKeys[id]?.addedAt || now, lastUsed: now };
+    // Over the cap, the app that has been quiet longest loses its place
+    const ids = Object.keys(this.appKeys);
+    if (ids.length > MAX_APP_KEYS) {
+      ids.sort((a, b) => this.appKeys[a].lastUsed - this.appKeys[b].lastUsed);
+      for (const stale of ids.slice(0, ids.length - MAX_APP_KEYS)) delete this.appKeys[stale];
+    }
+    await this.state.storage.put("appKeys", this.appKeys);
+  }
+
+  /** Forget public keys of apps that haven't called for a long time */
+  private async pruneAppKeys(now: number): Promise<void> {
+    let changed = false;
+    for (const [id, key] of Object.entries(this.appKeys)) {
+      if (now - key.lastUsed > APP_KEY_IDLE_LIMIT) {
+        delete this.appKeys[id];
+        changed = true;
+      }
+    }
+    if (changed) await this.state.storage.put("appKeys", this.appKeys);
+  }
+
+  /** POST /app-key - Internal: a newly paired app's public key. Body: { id, jwk } */
+  private async handleAppKeyAdd(request: Request): Promise<Response> {
+    let body: { id?: unknown; jwk?: unknown };
+    try {
+      body = await request.json();
+    } catch {
+      return this.jsonError("Invalid JSON", "PARSE_ERROR", 400);
+    }
+    const jwk = parsePublicJwk(body.jwk);
+    if (typeof body.id !== "string" || !APP_KEY_ID_PATTERN.test(body.id) || !jwk) {
+      return this.jsonError("Invalid app key", "INVALID_APP_KEY", 400);
+    }
+    await this.addAppKey(body.id, jwk, Date.now());
+    return this.jsonResponse({ ok: true });
+  }
+
+  /**
+   * DELETE /app-key - Internal: a disconnected app's key. Body: { id }
+   * Its wrapped copy of the snapshot key goes too.
+   */
+  private async handleAppKeyRemove(request: Request): Promise<Response> {
+    let body: { id?: unknown };
+    try {
+      body = await request.json();
+    } catch {
+      return this.jsonError("Invalid JSON", "PARSE_ERROR", 400);
+    }
+    if (typeof body.id !== "string") return this.jsonError("Invalid app key", "INVALID_APP_KEY", 400);
+    if (this.appKeys[body.id]) {
+      delete this.appKeys[body.id];
+      await this.state.storage.put("appKeys", this.appKeys);
+    }
+    const snapshot = await this.state.storage.get<StoredSnapshot>("snapshot");
+    if (snapshot?.wraps[body.id]) {
+      delete snapshot.wraps[body.id];
+      if (Object.keys(snapshot.wraps).length === 0) {
+        await this.state.storage.delete("snapshot");
+      } else {
+        await this.state.storage.put("snapshot", snapshot);
+      }
+    }
+    return this.jsonResponse({ ok: true });
+  }
+
+  /** Keep the plugin's manifest from a registration, if it sent a usable one */
+  private async storeManifest(value: unknown): Promise<void> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const input = value as Record<string, unknown>;
+    const manifest: Manifest = {};
+    const isList = (v: unknown): v is unknown[] =>
+      Array.isArray(v) && v.length <= 64 && v.every(item => item && typeof item === "object" && !Array.isArray(item));
+    if (isList(input.tools)) manifest.tools = input.tools;
+    if (isList(input.prompts)) manifest.prompts = input.prompts;
+    if (typeof input.instructions === "string") manifest.instructions = input.instructions.slice(0, 4000);
+    const info = input.serverInfo as Record<string, unknown> | undefined;
+    if (info && typeof info === "object") {
+      const pick = (v: unknown) => typeof v === "string" ? v.slice(0, 100) : undefined;
+      manifest.serverInfo = { name: pick(info.name), title: pick(info.title), version: pick(info.version) };
+    }
+    const encoded = JSON.stringify(manifest);
+    if (encoded.length > MAX_MANIFEST_BYTES) return;
+    // Registrations repeat on every reconnect; write only what changed
+    if (JSON.stringify(await this.state.storage.get<Manifest>("manifest")) === encoded) return;
+    await this.state.storage.put("manifest", manifest);
+  }
+
+  // ============================================
   // Helpers
   // ============================================
 
   private isDeviceOnline(): boolean {
     if (!this.deviceInfo || this.lastPollTime === 0) return false;
     return (Date.now() - this.lastPollTime) < SESSION_TIMEOUT;
+  }
+
+  /**
+   * Can the device be expected to pick up a request soon? Yes if it is
+   * waiting in a long poll, is working on a request, or was heard from
+   * within the last PICKUP_GRACE.
+   */
+  private deviceReachable(): boolean {
+    if (!this.deviceInfo) return false;
+    return this.pollWaiters.length > 0
+      || this.inFlight.size > 0
+      || (Date.now() - this.lastContact) < PICKUP_GRACE
+      || Date.now() < this.startupGraceUntil;
+  }
+
+  /**
+   * The device announced that it is going away: from now on requests get
+   * the offline answer at once, until it polls or registers again.
+   */
+  private async markLeft(): Promise<void> {
+    this.left = true;
+    this.lastSeen = Date.now();
+    this.lastContact = 0;
+    this.startupGraceUntil = 0;
+    this.releasePollWaiters();
+    await this.state.storage.put("lastSeen", this.lastSeen);
+  }
+
+  /** Note a sign of life from the device */
+  private touchContact(): void {
+    const now = Date.now();
+    this.left = false;
+    this.lastContact = now;
+    if (now - this.lastSeen > LAST_SEEN_WRITE_INTERVAL) {
+      this.lastSeen = now;
+      // Not awaited: the output gate holds responses until it is durable
+      void this.state.storage.put("lastSeen", now);
+    }
   }
 
   private removeWaiter(resolve: (req: QueuedRequest | null) => void): void {

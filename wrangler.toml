@@ -1,7 +1,9 @@
 name = "mcp-relay"
 main = "src/index.ts"
 compatibility_date = "2024-06-01"
-compatibility_flags = ["nodejs_compat"]
+# enable_request_signal: lets the relay notice when a reader's long poll is
+# closed from the reader's side (it went to sleep or stopped the server)
+compatibility_flags = ["nodejs_compat", "enable_request_signal"]
 
 # KV namespace for OAuth state (tokens, clients, codes)
 [[kv_namespaces]]
@@ -12,6 +14,11 @@ id = "e78c23710e5e4623813036dcbc5b251a"
 # secret; until then, legacy devices without a secret can still poll.
 [vars]
 REQUIRE_DEVICE_SECRET = "false"
+# Offline memory: a reader can store an encrypted snapshot of what is being
+# read, so paired AI apps can still ask about it while the reader is offline.
+# Largest snapshot in bytes ("0" turns the feature off) and longest retention.
+SNAPSHOT_MAX_BYTES = "262144"
+SNAPSHOT_MAX_RETENTION_DAYS = "30"
 
 # Durable Objects binding
 [[durable_objects.bindings]]
